@@ -24,14 +24,36 @@ describe('validateClaudeEffortCompatibility', () => {
     expect(() => validateClaudeEffortCompatibility('claude-opus-4-7-20260101', 'xhigh')).not.toThrow();
   });
 
-  it('Given Opus 4.6 with xhigh, When validate, Then throw with helpful message', () => {
+  it('Given Opus 4.8 with xhigh, When validate, Then no throw', () => {
+    expect(() => validateClaudeEffortCompatibility('claude-opus-4-8', 'xhigh')).not.toThrow();
+  });
+
+  it('Given Sonnet 5 with xhigh, When validate, Then no throw', () => {
+    expect(() => validateClaudeEffortCompatibility('claude-sonnet-5', 'xhigh')).not.toThrow();
+  });
+
+  it('Given date-pinned Sonnet 5 with xhigh, When validate, Then no throw (prefix match)', () => {
+    expect(() => validateClaudeEffortCompatibility('claude-sonnet-5-20260101', 'xhigh')).not.toThrow();
+  });
+
+  it('Given Fable 5 with xhigh, When validate, Then no throw', () => {
+    expect(() => validateClaudeEffortCompatibility('claude-fable-5', 'xhigh')).not.toThrow();
+  });
+
+  it('Given Opus 4.6 with xhigh, When validate, Then throw with helpful message listing all supported models', () => {
     expect(() => validateClaudeEffortCompatibility('claude-opus-4-6', 'xhigh'))
       .toThrow(/'xhigh' is not supported by model 'claude-opus-4-6'/);
     expect(() => validateClaudeEffortCompatibility('claude-opus-4-6', 'xhigh'))
       .toThrow(/Opus 4\.7/);
+    expect(() => validateClaudeEffortCompatibility('claude-opus-4-6', 'xhigh'))
+      .toThrow(/Opus 4\.8/);
+    expect(() => validateClaudeEffortCompatibility('claude-opus-4-6', 'xhigh'))
+      .toThrow(/Sonnet 5/);
+    expect(() => validateClaudeEffortCompatibility('claude-opus-4-6', 'xhigh'))
+      .toThrow(/Fable 5/);
   });
 
-  it('Given Sonnet 4.6 with xhigh, When validate, Then throw', () => {
+  it('Given Sonnet 4.6 (does not match new Sonnet 5 prefix) with xhigh, When validate, Then throw', () => {
     expect(() => validateClaudeEffortCompatibility('claude-sonnet-4-6', 'xhigh'))
       .toThrow(/not supported/);
   });
