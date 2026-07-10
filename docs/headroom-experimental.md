@@ -44,6 +44,8 @@ provider_options:
 
 TAKT passes this to the Codex SDK constructor as `baseUrl`. Provider-native env behavior such as `OPENAI_BASE_URL` remains provider-dependent; prefer TAKT `provider_options.codex.base_url` when you want explicit workflow routing.
 
+Cursor is **not** supported for Headroom `base_url` routing. The `cursor-agent` CLI has no env or CLI flag to override the API endpoint (`--endpoint` / `--base-url` are absent; documented env covers proxy/CA/config paths only). Cursor talks to Cursor's own backend, not an OpenAI/Anthropic-compatible terminal that Headroom can sit in front of. Setting `provider_options.cursor.base_url` has no effect: workflow YAML `provider_options` uses a strict schema and rejects the unknown key, while global/project `config.yaml` `provider_options` strips unknown keys silently (no error, no routing). Do not use `HTTP_PROXY` / `HTTPS_PROXY` as a substitute: those are transport forward proxies and do not replace the API base URL the way Headroom expects.
+
 Workflow and project config `base_url` values are limited to loopback hosts. This fits the intended Headroom setup, where TAKT talks to a local proxy such as `127.0.0.1:8787`. Configure non-loopback proxy endpoints from global config or TAKT env only.
 
 ## Limitations
