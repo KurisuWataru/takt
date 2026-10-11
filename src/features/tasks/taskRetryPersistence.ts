@@ -7,6 +7,7 @@ import {
   type PersistedTaskOrderRevision,
 } from './orderRevision.js';
 import { assertReusableWorktreePath } from './execute/reusedWorktree.js';
+import { checkQueuedTaskProviders, terminalProviderConfirmation } from './execute/providerPreflight.js';
 
 export interface FailedTaskRetryPersistenceOptions {
   readonly task: TaskListItem;
@@ -38,12 +39,16 @@ export function appendRetryNote(existing: string | undefined, additional: string
 }
 
 /** Persist an approved failed-task retry and return the task to pending. */
-export function persistFailedTaskRetry(options: FailedTaskRetryPersistenceOptions): void {
+export async function persistFailedTaskRetry(options: FailedTaskRetryPersistenceOptions): Promise<void> {
   if (options.task.kind !== 'failed') {
     throw new Error(`Failed task retry persistence requires failed task. received: ${options.task.kind}`);
   }
 
   assertReusableWorktreePath(options.projectDir, options.worktreePath);
+  await checkQueuedTaskProviders(options.projectDir, options.task, {}, terminalProviderConfirmation(), undefined, {
+    workflow: options.workflow,
+    worktreePath: options.worktreePath,
+  });
   let revision: PersistedTaskOrderRevision | undefined;
   try {
     if (options.revisedOrder !== undefined) {

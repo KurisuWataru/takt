@@ -67,6 +67,10 @@ export class TaskRunner {
     return this.query.listTasks();
   }
 
+  listTasksForProviderPreflight(goalTasksOnly = false): TaskInfo[] {
+    return this.query.listTasksForProviderPreflight(goalTasksOnly);
+  }
+
   claimNextTasks(count: number): TaskInfo[] {
     return this.lifecycle.claimNextTasks(count);
   }
@@ -136,6 +140,10 @@ export class TaskRunner {
 
   autoRequeueFailedTask(taskRef: string, options: { maxAttempts: number }): AutoRequeueResult {
     return this.retry.autoRequeueFailedTask(taskRef, options);
+  }
+
+  isAutoRequeueEligible(taskRef: string, maxAttempts: number): boolean {
+    return this.retry.isAutoRequeueEligible(taskRef, maxAttempts);
   }
 
   requeueTask(
