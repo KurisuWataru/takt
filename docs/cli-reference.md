@@ -663,9 +663,9 @@ Run a workflow for a pull request. With an explicit number, selection conditions
 takt merge 123
 takt merge 123 --workflow merge-review-fix
 takt merge 123 --workflow merge-review
-takt merge --author alice --label ready --include-forks
+takt merge --author alice --label ready --include-forks --concurrency 4
 ```
 
-By default, draft PRs and forks are excluded. Use `--include-draft` and `--include-forks` to include them. Any CLI selection condition replaces all configured selection conditions. Workflows run up to the configured concurrency; a failure for one PR does not stop the others. The command exits with code 1 if any processed PR remains unmerged.
+By default, draft PRs and forks are excluded. Use `--include-draft` and `--include-forks` to include them. Any CLI selection condition replaces all configured selection conditions. Bulk runs execute two PR workflows at a time by default; `merge.concurrency` changes this limit and `--concurrency` overrides it for one invocation. An explicit PR number processes only that PR. A failure for one PR does not stop the others. When `caccia.enabled` is true, a workflow's PR push waits for CodeRabbit and Caccia before CI and merge decisions use the latest head. The command exits with code 1 if any processed PR remains unmerged.
 
 Workflow selection uses the CLI override, then `merge.workflow`, then `merge-review-fix-simple`. The default gathers context and gives one agent dynamic facets to review, fix, and verify code quality. It shares synchronization, conflict resolution, push, new-head CI waiting, approval, and merging with `merge-review-fix`. Use `--workflow merge-review-fix` for parallel review and adjudication.
