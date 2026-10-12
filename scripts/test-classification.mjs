@@ -392,6 +392,7 @@ export const lightNamedIntegrationTestFiles = Object.freeze([
   'src/__tests__/it-workflow-maker-retry-availability.test.ts',
   'src/__tests__/it-workflow-policy.test.ts',
   'src/__tests__/kiro-provider-integration.test.ts',
+  'src/__tests__/merge-caccia.test.ts',
   'src/__tests__/merge-pagination.integration.test.ts',
   'src/__tests__/merge-settings.integration.test.ts',
   'src/__tests__/opencode-managed-sdk-state.integration.test.ts',

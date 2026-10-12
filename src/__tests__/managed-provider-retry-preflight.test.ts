@@ -3,7 +3,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { checkQueuedTaskProviders } from '../features/tasks/execute/providerPreflight.js';
-import type { TaskInfo } from '../infra/task/index.js';
+import { prepareFailedTaskRetry } from '../features/tasks/taskRetryPreparation.js';
+import { persistFailedTaskRetry } from '../features/tasks/taskRetryPersistence.js';
+import { TaskRunner, type TaskInfo } from '../infra/task/index.js';
 import * as config from '../infra/config/index.js';
 import { checkWorkflowProviders } from '../infra/config/runtime-provider/execution-preparation.js';
 
@@ -59,6 +61,39 @@ describe('managed provider preflight for reused worktrees', () => {
     await expect(checkQueuedTaskProviders(project, { ...task, kind: 'failed' }, {}, undefined))
       .rejects.toThrow('SDK declined');
     expect(fs.readFileSync(cloneWorkflow, 'utf8')).toBe(workflow(sync ? 'root-workflow' : 'clone-before-decline'));
+  });
+
+  it('requeues an unprepared PR merge clone after checking the project workflow', async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'takt-preflight-merge-retry-'));
+    temporaryProjects.push(project);
+    const clone = path.join(project, '.takt', 'worktrees', 'merge-pr-123');
+    const workflowPath = path.join(project, '.takt', 'workflows', 'merge.yaml');
+    fs.mkdirSync(path.dirname(workflowPath), { recursive: true });
+    fs.writeFileSync(workflowPath, 'name: merge\ninitial_step: review\nmax_steps: 1\nsteps:\n  - name: review\n    instruction: "{task}"\n');
+    const runner = new TaskRunner(project);
+    const started = runner.startPrMergeTask({
+      prNumber: 123, headBranch: 'feature/pr', baseBranch: 'main', headSha: 'a'.repeat(40),
+      headRepositoryUrl: 'https://example.test/repo.git',
+      headRepositoryPushUrls: ['https://example.test/repo.git'],
+      workflow: './.takt/workflows/merge.yaml', method: 'merge', worktreePath: clone,
+      threatCheckMaxDiffBytes: 1000, cacciaRequired: false,
+    });
+    runner.forceFailRunningTask(started.name, { step: 'review', error: 'merge failed' });
+    const failed = runner.listFailedTasks()[0]!;
+
+    const preparation = prepareFailedTaskRetry(failed, project);
+    expect(preparation.interactionCwd).toBe(project);
+    expect(preparation.worktreePath).toBe(clone);
+    await persistFailedTaskRetry({
+      task: failed, projectDir: project, worktreePath: preparation.worktreePath,
+      startStep: undefined, retryNote: undefined, resumePoint: undefined,
+      workflow: undefined, taskDir: undefined, sourceRunSlug: null, restartPoint: undefined,
+    });
+
+    expect(vi.mocked(checkWorkflowProviders).mock.calls.at(-1)?.[1]).toBe(project);
+    expect(vi.mocked(checkWorkflowProviders).mock.calls.at(-1)?.[2].name).toBe('merge');
+    expect(runner.listTasks()[0]?.status).toBe('pending');
+    expect(fs.existsSync(clone)).toBe(false);
   });
 
   it.each([true, false])('checks only the SDK of the workflow used by a reused clone with project sync %s', async (sync) => {

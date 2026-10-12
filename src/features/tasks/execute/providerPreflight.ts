@@ -4,7 +4,7 @@ import { checkWorkflowProviders, type WorkflowProviderPreparationOptions } from 
 import { checkManagedProviders, type ConfirmManagedProvider } from '../../../infra/managed-providers/preflight.js';
 import type { TaskInfo, TaskListItem, TaskRunner } from '../../../infra/task/index.js';
 import { DEFAULT_WORKFLOW_NAME } from '../../../shared/constants.js';
-import { resolveReusedWorktreeExecution, toReusedTaskInfo, type ReusedTaskPreparationOverride } from './reusedWorktree.js';
+import { assertPrMergeRetryWorktreePath, resolveReusedWorktreeExecution, toReusedTaskInfo, type ReusedTaskPreparationOverride } from './reusedWorktree.js';
 
 export function terminalProviderConfirmation(): ConfirmManagedProvider | undefined {
   return process.stdin.isTTY === true && process.stdout.isTTY === true && !process.env.CI && process.env.TAKT_NO_TTY !== '1'
@@ -34,7 +34,14 @@ export async function checkTaskNameProvider(cwd: string, confirmation: ConfirmMa
 
 export async function checkQueuedTaskProviders(cwd: string, task: TaskInfo | TaskListItem, options: WorkflowProviderPreparationOptions, confirmation: ConfirmManagedProvider | undefined, signal?: AbortSignal, preparation?: ReusedTaskPreparationOverride): Promise<void> {
   const executionTask = toReusedTaskInfo(task, preparation);
-  const reused = executionTask.data?.worktree ? resolveReusedWorktreeExecution(cwd, executionTask) : undefined;
+  const unpreparedMergeClone = executionTask.data?.worktree && executionTask.data.merge_task === true
+    && executionTask.data.merge_clone_prepared === false;
+  if (unpreparedMergeClone) {
+    if (!executionTask.worktreePath) throw new Error(`Worktree path is not set for task: ${executionTask.name}`);
+    assertPrMergeRetryWorktreePath(cwd, executionTask.worktreePath, false);
+  }
+  const reused = executionTask.data?.worktree && !unpreparedMergeClone
+    ? resolveReusedWorktreeExecution(cwd, executionTask) : undefined;
   await checkTaskProviders(cwd, executionTask.data?.workflow ?? DEFAULT_WORKFLOW_NAME, options, confirmation, signal, reused?.execCwd);
   if (executionTask.data?.worktree && executionTask.slug == null && reused === undefined) {
     await checkTaskNameProvider(cwd, confirmation, signal);

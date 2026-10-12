@@ -6,7 +6,7 @@ import {
   persistTaskOrderRevision,
   type PersistedTaskOrderRevision,
 } from './orderRevision.js';
-import { assertReusableWorktreePath } from './execute/reusedWorktree.js';
+import { assertPrMergeRetryWorktreePath, assertReusableWorktreePath } from './execute/reusedWorktree.js';
 import { checkQueuedTaskProviders, terminalProviderConfirmation } from './execute/providerPreflight.js';
 
 export interface FailedTaskRetryPersistenceOptions {
@@ -44,7 +44,15 @@ export async function persistFailedTaskRetry(options: FailedTaskRetryPersistence
     throw new Error(`Failed task retry persistence requires failed task. received: ${options.task.kind}`);
   }
 
-  assertReusableWorktreePath(options.projectDir, options.worktreePath);
+  const assertWorktree = (): void => {
+    if (options.task.data?.merge_task === true) {
+      assertPrMergeRetryWorktreePath(options.projectDir, options.worktreePath,
+        options.task.data.merge_clone_prepared === true);
+    } else {
+      assertReusableWorktreePath(options.projectDir, options.worktreePath);
+    }
+  };
+  assertWorktree();
   await checkQueuedTaskProviders(options.projectDir, options.task, {}, terminalProviderConfirmation(), undefined, {
     workflow: options.workflow,
     worktreePath: options.worktreePath,
@@ -61,7 +69,7 @@ export async function persistFailedTaskRetry(options: FailedTaskRetryPersistence
       );
     }
 
-    assertReusableWorktreePath(options.projectDir, options.worktreePath);
+    assertWorktree();
     new TaskRunner(options.projectDir).requeueTask(
       options.task.name,
       ['failed'],
