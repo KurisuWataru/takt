@@ -5,6 +5,7 @@ import { resolveConfigValue } from '../../infra/config/index.js';
 import {
   fetchCacciaPullRequestDetails,
   fetchCacciaPullRequestHeadSha,
+  fetchCodeRabbitCommitActivity,
   fetchCodeRabbitReviewStatus,
   fetchCodeRabbitReviewThreads,
   requestCodeRabbitReview,
@@ -110,7 +111,7 @@ export interface CacciaResult {
   headSha?: string;
   exitCode?: number;
   reason?: string;
-  skipReason?: 'initial_review_unavailable' | 'review_rate_limited';
+  skipReason?: 'no_coderabbit_activity' | 'initial_review_unavailable' | 'review_rate_limited';
 }
 
 interface CacciaInputBase extends CacciaDisplayOptions {
@@ -122,20 +123,23 @@ interface CacciaInputBase extends CacciaDisplayOptions {
 export type CacciaInput = CacciaInputBase & (
   | { entry: 'standalone'; prNumber: number }
   | { entry: 'linked'; prNumber?: number; prUrl?: string; expectedInitialHeadSha?: string;
-      onPushedHead?: (headSha: string) => void }
+      skipIfNoCodeRabbitActivity?: boolean; onPushedHead?: (headSha: string) => void }
 );
 
 export interface CacciaReviewWaitOptions {
   timeoutMs: number;
   afterHeadSha?: string;
+  allowNoActivitySkip?: boolean;
 }
+
+export type CacciaReviewWaitResult = { headSha: string; noActivity?: boolean };
 
 export interface CacciaDependencies {
   detectVcsProvider(projectCwd: string): string | undefined;
   waitForCodeRabbitReview(
     prNumber: number,
     options: CacciaReviewWaitOptions,
-  ): Promise<{ headSha: string } | { rateLimited: true } | undefined>;
+  ): Promise<CacciaReviewWaitResult | { rateLimited: true } | undefined>;
   fetchCodeRabbitReviewThreads(
     prNumber: number,
     projectCwd: string,
@@ -191,7 +195,7 @@ async function waitForCodeRabbitReview(
   options: CacciaReviewWaitOptions,
   signal: AbortSignal | undefined,
   out: CacciaOutput,
-): Promise<{ headSha: string } | { rateLimited: true } | undefined> {
+): Promise<CacciaReviewWaitResult | { rateLimited: true } | undefined> {
   const deadline = Date.now() + options.timeoutMs;
   let sawRateLimit = false;
   let requestedReview = false;
@@ -242,6 +246,17 @@ async function waitForCodeRabbitReview(
       && status.reviewedHeadShas.includes(options.afterHeadSha)
     ) {
       return { headSha: options.afterHeadSha };
+    }
+    if (options.allowNoActivitySkip && options.afterHeadSha !== undefined
+      && status.headSha === options.afterHeadSha && !status.hasCodeRabbitPost
+      && !status.hasCodeRabbitReviewActivity && !status.hasCodeRabbitThreadReplyActivity
+      && !status.hasUnknownCodeRabbitThreadActivity && !status.hasUnknownCodeRabbitPostActivity) {
+      const activity = await fetchCodeRabbitCommitActivity(
+        prNumber, projectCwd, options.afterHeadSha, deadline, signal,
+      );
+      assertNotAborted(signal);
+      if (activity === undefined || deadline - Date.now() <= 0) return undefined;
+      if (!activity.detected) return { headSha: activity.headSha, noActivity: true };
     }
 
     const remainingMs = deadline - Date.now();
@@ -597,6 +612,8 @@ async function runCacciaWithDependencies(
     timeoutMs: input.settings.waitTimeoutMs,
     ...(input.entry === 'linked' && input.expectedInitialHeadSha !== undefined
       ? { afterHeadSha: input.expectedInitialHeadSha } : {}),
+    ...(input.entry === 'linked' && input.skipIfNoCodeRabbitActivity === true
+      ? { allowNoActivitySkip: true } : {}),
   });
   if (initialReview === undefined) {
     return finishResult(input, createResult(input, 'skipped', 0,
@@ -609,6 +626,16 @@ async function runCacciaWithDependencies(
   if (input.entry === 'linked' && input.expectedInitialHeadSha !== undefined
     && initialReview.headSha !== input.expectedInitialHeadSha) {
     throw new Error(`Pull request #${prNumber} head changed before Caccia's initial review`);
+  }
+  if (initialReview.noActivity) {
+    if (input.entry !== 'linked' || !input.skipIfNoCodeRabbitActivity
+      || input.expectedInitialHeadSha === undefined) {
+      throw new Error('Unexpected CodeRabbit activity result outside the linked merge wait');
+    }
+    return finishResult(input, {
+      ...createResult(input, 'skipped', 0, 'No CodeRabbit activity was detected on this pull request', initialReview.headSha),
+      skipReason: 'no_coderabbit_activity',
+    }, dependencies, out);
   }
 
   let reviewedHeadSha = initialReview.headSha;
