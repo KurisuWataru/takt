@@ -7,6 +7,11 @@ const evalDir = dirname(fileURLToPath(import.meta.url));
 const CLASSIFICATIONS = [
   {
     tier: 'active',
+    reason: '完了検証・再計画・レビュー裁定で反例に使う入力の根拠を確かめ、実在する欠陥を維持する境界を測る',
+    suites: ['fix-verification-applicable-inputs'],
+  },
+  {
+    tier: 'active',
     reason: 'Phase 3 が入力の結論をルールへ対応づけ、入力外の再評価と入力内の矛盾を区別するか測る',
     suites: ['phase3-follow-input'],
   },
@@ -188,6 +193,10 @@ const CLASSIFICATIONS = [
 ];
 
 const EXECUTION_OVERRIDES = {
+  'fix-verification-applicable-inputs': {
+    defaultEligible: false, credentials: ['claude', 'codex'], cost: 'high',
+    reason: 'Sol Low、Opus 5、Luna Max の3モデルで完了検証・再計画・レビュー裁定の入力範囲を比較する明示選択の評価',
+  },
   'review-external-confirmation': {
     defaultEligible: false, credentials: ['codex', 'claude'], cost: 'high',
     reason: 'Sol Low、Opus 5、Luna Max の3モデルで外部確認の境界を比較する明示選択の評価',
@@ -597,6 +606,8 @@ const EXECUTION_OVERRIDES = {
 };
 
 const PREPARE_TARGET_OVERRIDES = {
+  'fix-verification-applicable-inputs': ['f1', 'f2', 'f3', 'r1', 'r2', 'n1', 'n2', 'n3', 'n4', 'n5', 'a1', 'a2', 'a3', 'a4']
+    .map((caseId) => `fix-verification-applicable-inputs-${caseId}`),
   'security-threat-model': ['a1', 'a2', 'a3', 'a4', 'a5']
     .map((caseId) => `security-threat-model-${caseId}`),
   'secondary-platform-adjudication': [
