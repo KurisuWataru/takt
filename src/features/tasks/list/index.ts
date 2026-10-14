@@ -29,6 +29,7 @@ import { formatTaskStatusLabel, formatShortDate } from './taskStatusLabel.js';
 import { resolveConfigValues } from '../../../infra/config/index.js';
 import { runTui } from '../../tui/index.js';
 import type { InteractiveModeResult } from '../../interactive/interactive.js';
+import { resolveInstructionIssue } from '../../interactive/issueBinding.js';
 
 export type { ListNonInteractiveOptions } from './listNonInteractive.js';
 
@@ -168,13 +169,14 @@ async function dispatchListConversation(
   agentOverrides?: TaskExecutionOptions,
 ): Promise<ConversationDispatchOutcome | void> {
   const issueContextReplacement = result.issueContextReplacement;
+  const boundIssue = resolveInstructionIssue(result.task, issueContextReplacement?.issueNumber);
   const traceTaskContext = issueContextReplacement === undefined
     ? undefined
     : {
       source: 'issue' as const,
-      ...(issueContextReplacement.issueNumber === undefined
+      ...(boundIssue === undefined
         ? {}
-        : { issueNumber: issueContextReplacement.issueNumber }),
+        : { issueNumber: boundIssue }),
     };
 
   switch (result.action) {
@@ -193,9 +195,9 @@ async function dispatchListConversation(
       const labels = await promptLabelSelection(lang);
       await createIssueAndSaveTask(cwd, result.task, workflowId, {
         labels,
-        ...(issueContextReplacement?.issueNumber === undefined
+        ...(boundIssue === undefined
           ? {}
-          : { sourceIssue: { number: issueContextReplacement.issueNumber, language: lang } }),
+          : { sourceIssue: { number: boundIssue, language: lang } }),
         ...(result.attachments ? { attachments: result.attachments } : {}),
       });
       return;
@@ -210,9 +212,9 @@ async function dispatchListConversation(
     }
     case 'save_task':
       await saveTaskFromInteractive(cwd, result.task, workflowId, {
-        ...(issueContextReplacement?.issueNumber === undefined
+        ...(boundIssue === undefined
           ? {}
-          : { issue: issueContextReplacement.issueNumber }),
+          : { issue: boundIssue }),
         ...(result.attachments ? { attachments: result.attachments } : {}),
       });
       return;
