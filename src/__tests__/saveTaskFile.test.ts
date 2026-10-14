@@ -692,7 +692,7 @@ describe('createIssueAndSaveTask', () => {
     mockPromptInput.mockResolvedValueOnce('');
     mockConfirm.mockResolvedValueOnce(false);
 
-    await createIssueAndSaveTask(testDir, 'Review [Image #1].', 'default', {
+    const result = await createIssueAndSaveTask(testDir, 'Review [Image #1].', 'default', {
       attachments: [attachment],
     });
 
@@ -705,6 +705,8 @@ describe('createIssueAndSaveTask', () => {
     const orderContent = fs.readFileSync(path.join(taskDir, 'order.md'), 'utf-8');
     expect(task.issue).toBe(42);
     expect(task.workflow).toBe('default');
+    expect(result).toMatchObject({ success: true, created: { issueNumber: 42, workflow: 'default' } });
+    expect(result).toMatchObject({ created: { taskName: expect.any(String) } });
     expect(orderContent).toContain('Review [Image #1].');
     expect(orderContent).toContain('- [Image #1]: `attachments/image-1.png`');
     expect(fs.readFileSync(path.join(taskDir, 'attachments', 'image-1.png'), 'utf-8')).toBe('issue-image');
@@ -751,7 +753,7 @@ describe('createIssueAndSaveTask', () => {
     mockPromptInput.mockResolvedValueOnce('');
     mockConfirm.mockResolvedValueOnce(false);
 
-    await createIssueAndSaveTask(testDir, 'Review [Image #1].', 'default', {
+    const result = await createIssueAndSaveTask(testDir, 'Review [Image #1].', 'default', {
       attachments: [{
         placeholder: '[Image #1]',
         tempPath: directoryAttachment,
@@ -764,5 +766,39 @@ describe('createIssueAndSaveTask', () => {
       "#42",
     ));
     expectNoTaskArtifacts(testDir);
+    expect(result).toMatchObject({
+      success: false,
+      failure: { issueCreated: true, issueNumber: 42, taskEnqueued: false, stage: 'task_saving' },
+    });
+    expect(mockCreateIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it('should return the issue creation failure without saving or inventing an issue number', async () => {
+    mockCreateIssue.mockReturnValue({ success: false, error: 'permission denied' });
+
+    const result = await createIssueAndSaveTask(testDir, 'Create execution issue', 'default');
+
+    expect(result).toEqual({
+      success: false,
+      failure: { issueCreated: false, taskEnqueued: false, stage: 'issue_creation', error: 'permission denied' },
+    });
+    expectNoTaskArtifacts(testDir);
+    expect(mockPromptInput).not.toHaveBeenCalled();
+    expect(mockCreateIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it('should return a created issue with an unknown number without saving a task', async () => {
+    mockCreateIssue.mockReturnValue({ success: true, issueNumber: 0, url: 'https://github.com/owner/repo/issues/unknown' });
+
+    const result = await createIssueAndSaveTask(testDir, 'Create execution issue', 'default');
+
+    expect(result).toMatchObject({
+      success: false,
+      failure: { issueCreated: true, taskEnqueued: false, stage: 'issue_number_parsing', error: expect.any(String) },
+    });
+    expect(result).toHaveProperty('failure');
+    expect(result).not.toHaveProperty('failure.issueNumber');
+    expectNoTaskArtifacts(testDir);
+    expect(mockCreateIssue).toHaveBeenCalledTimes(1);
   });
 });

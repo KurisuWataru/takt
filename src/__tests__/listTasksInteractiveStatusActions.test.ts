@@ -176,6 +176,8 @@ const runningInteractiveTask: TaskListItem = {
 
 describe('listTasks interactive status actions', () => {
   beforeEach(() => {
+    mockSelectAndExecuteTask.mockResolvedValue({ success: true });
+    mockSaveTaskFromInteractive.mockResolvedValue({ taskName: 'saved-task', tasksFile: '/project/.takt/tasks.yaml' });
     vi.clearAllMocks();
     mockCheckTaskProviders.mockResolvedValue(undefined);
   });
@@ -332,7 +334,7 @@ describe('listTasks interactive status actions', () => {
       '/project',
       'task for multiple Issues',
       'default',
-      {},
+      { allowCancel: true },
     );
   });
 
