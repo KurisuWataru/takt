@@ -292,7 +292,7 @@ workflow ファイルの正式ディレクトリ名は `workflows/` です。
 | `takt ui` | 実験的な Viewer 中心の Web UI を `http://127.0.0.1:20525` で起動します |
 | `takt list` | タスクブランチを管理します（マージ、リトライ、リキュー、強制失敗、追加指示、削除） |
 | `takt #N` | GitHub Issue を初期入力としてタスク化します |
-| `takt merge` | （実験的）workflow で PR のレビュー・修正・マージを行います |
+| `takt merge` | workflow で PR のレビュー・修正・マージを行います |
 | `takt install <provider>` | SDK 経由 provider の SDK をインストールします |
 | `takt update` | インストール済みの provider SDK を TAKT が固定した版に更新します |
 | `takt eject` | ビルトインの workflow/facet をコピーしてカスタマイズできます |

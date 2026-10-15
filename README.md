@@ -290,7 +290,7 @@ See the [Builtin Catalog](./docs/builtin-catalog.md) for all workflows and perso
 | `takt ui` | Open the experimental Viewer-first Web UI on `http://127.0.0.1:20525` |
 | `takt list` | Manage task branches (merge, retry, requeue, force-fail, instruct, delete) |
 | `takt #N` | Use a GitHub Issue as the initial input for a task |
-| `takt merge` | (Experimental) Review, fix, and merge pull requests with a workflow |
+| `takt merge` | Review, fix, and merge pull requests with a workflow |
 | `takt install <provider>` | Install the SDK for an SDK-based provider |
 | `takt update` | Update installed provider SDKs to the versions pinned by TAKT |
 | `takt eject` | Copy builtin workflows/facets for customization |
