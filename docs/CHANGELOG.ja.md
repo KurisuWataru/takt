@@ -12,7 +12,7 @@
 
 ### Added
 
-- `takt merge [pr-number]` で、PR のレビュー・修正・マージを行う workflow を実行できるようにしました (#1704)。番号を省くと、`--author`、`--label`、`--base`、`--head`、`--managed-by-takt`、`--include-forks`、`--include-draft`、または設定の `merge.where` で開いている PR を選びます。下書きと fork は既定で除外し、fork の PR は脅威チェックを通します。既定の workflow は `merge-review-fix-simple`(読み取り専用のレビュアー 1 人のあと、裁定・修正・検証を別の step で行う)で、並列レビューは `--workflow merge-review-fix` で使えます。既定では 2 件ずつ並行して処理し(`merge.concurrency`、`--concurrency`)、マージ方法の既定は `squash` です(`merge.method`)。PR ごとに `takt list` のタスクとして記録して隔離した clone で実行し、失敗したタスクは Requeue / Retry で再開できます。`caccia.enabled` が true なら、push のたびに CodeRabbit と Caccia を挟みます。処理した PR が 1 件でも未マージのまま残ると、終了コードは 1 です。
+- 実験的機能として、PR のレビュー・修正・マージを workflow で行う `takt merge [pr-number]` を追加しました (#1704)。詳しくは [CLI リファレンス](./cli-reference.ja.md#takt-merge) を参照してください。
 - `takt update [provider]` で、インストール済みの provider SDK を TAKT が固定した版に更新できるようにしました。provider を省くと、版がずれているインストール済みの provider だけを更新します。
 - DeepSeek Harness provider で、`provider_options.deepseek_harness.plugins`(`id`、`source`、`ref`、`config`)から Git の plugin を読み込めるようにしました。plugin は HTTPS か SSH で一時的な runtime に clone します。定義できるのは global 設定、信頼された global の runtime profile、`TAKT_PROVIDER_OPTIONS_DEEPSEEK_HARNESS_PLUGINS` だけで、プロジェクトで定義した plugin は拒否します。lifecycle scripts は実行せず、`config` の値はログに出しません。
 - `/tell`、`/retry`、`/requeue`、指示書の修正で AI がタスクを選んだり指示を作ったりしている間、TUI の状態行に進捗を表示するようにしました。
