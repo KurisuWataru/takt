@@ -257,17 +257,19 @@ The optional `caccia` object is accepted in both `~/.takt/config.yaml` and `.tak
 
 ```yaml
 caccia:
-  enabled: false          # Enable automatic Caccia after a task creates or updates a PR
+  enabled: false          # Allow the caccia effect to wait for CodeRabbit
   wait_timeout_ms: 1800000 # Maximum wait for the initial review and each pushed commit review, in milliseconds
   max_iterations: 3       # Maximum fix-and-review iterations
   workflow: caccia        # Workflow used to judge and fix each set of threads
 ```
 
-The linked path runs only when `enabled` is `true`. The standalone `takt caccia <PR-number>` command is available regardless of this flag. Defaults are disabled, 1,800,000 milliseconds, 3 iterations, and workflow `caccia`. A project `caccia` block takes precedence over the global block; omitted fields in the selected block receive these defaults. Set `workflow` to a workflow identifier to replace the builtin workflow.
+The `caccia` effect waits for CodeRabbit only when `enabled` is `true`; otherwise it returns `skipped` with `skipReason: config_disabled` immediately. The standalone `takt caccia <PR-number>` command is available regardless of this flag. Defaults are disabled, 1,800,000 milliseconds, 3 iterations, and workflow `caccia`. A project `caccia` block takes precedence over the global block; omitted fields in the selected block receive these defaults. Set `workflow` to a workflow identifier to replace the builtin workflow.
 
-`wait_timeout_ms` bounds the initial review wait and each pushed-commit review wait, including a retry request. If a CodeRabbit rate-limit notice gives a retry time before the deadline, Caccia requests one review when that time arrives; a retry time at or beyond the deadline skips Caccia immediately. A review still incomplete at the deadline after a rate-limit notice also skips Caccia. Without a rate-limit notice, an initial timeout skips Caccia and a pushed-commit timeout is an error. The standalone command exits non-zero in either case; linked execution preserves the completed task result and logs errors.
+`wait_timeout_ms` bounds the initial review wait and each pushed-commit review wait, including a retry request. If a CodeRabbit rate-limit notice gives a retry time before the deadline, Caccia requests one review when that time arrives; a retry time at or beyond the deadline skips Caccia immediately. A review still incomplete at the deadline after a rate-limit notice also skips Caccia. Without a rate-limit notice, an initial timeout skips Caccia and a pushed-commit timeout is an error. The standalone command exits non-zero in either case; the system effect returns failures as `success: false` with `error` for workflow routing.
 
-Linked progress, workflow output, results, and failures inherit the parent task's display mode and task prefix. Silent parents produce no Caccia screen output.
+Effect progress, workflow output, results, and failures inherit the parent task's display mode and task prefix. Silent parents produce no Caccia screen output.
+
+The merge builtins execute Caccia explicitly: `merge-review` runs `review → caccia → wait_ci → evaluation comment`, while `merge-review-fix` and `merge-review-fix-simple` run `review/fix → commit_and_push → caccia → wait_ci → merge_pr`. `success` and `skipped` continue to CI on the returned head. `limit` comments with the unresolved thread count and ends COMPLETE without merging. An effect error comments with `error` and ends ABORT. Push, task post-processing, and Pipeline no longer start Caccia implicitly. With `merge.auto_start: true`, PR publication starts the merge workflow, whose explicit effect owns Caccia.
 
 ## Project Configuration
 
@@ -1734,6 +1736,8 @@ Interactive entry points confirm required installations and approximate disk spa
 Approximate sizes are 250 MB for Claude SDK, 340 MB for Codex, 60 MB for OpenCode, 52 MB for Pi and 510 MB for DeepSeek Harness (measured on macOS arm64). Sizes vary by OS and architecture. Claude and Codex include managed CLI binaries. Explicit `TAKT_CLAUDE_CLI_PATH` and `TAKT_CODEX_CLI_PATH` overrides remain supported; same-name commands on PATH are not reused automatically. Install the external OpenCode CLI separately. Use `takt install <provider> --force` to reinstall. Failed updates preserve the previous intact generation.
 
 ## Merge selection
+
+GitLab supports MR details, CI status acquisition, and bulk selection. When Caccia is enabled, its effect in `takt merge` and `from_pr` tasks returns `skipped` with `github_unavailable` and continues to CI on the returned head. Merged results pipelines are matched through the merge commit's second parent and the source head. Missing pipelines and pipelines for an older head do not pass CI. Selecting a merge method or constraining the head is still unsupported: `merge_pr` fails when either is supplied. Completing the CI wait does not imply a successful merge.
 
 The default `merge.workflow` is `merge-review-fix-simple`. It gathers context, runs one read-only reviewer with dynamic facets, then adjudicates findings and handles fixes and verification in separate steps before the shared push, CI, CHANGES_REQUESTED, and merge flow. Set `merge.workflow: merge-review-fix` to use parallel review. A CLI `--workflow` overrides this setting.
 
