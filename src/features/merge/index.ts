@@ -14,6 +14,7 @@ import { buildSafeGitEnvironment } from '../../infra/task/git-environment.js';
 import { createPrCloneGitOperations } from '../../infra/workflow/system/pr-clone-git.js';
 import { assertPrMergeCloneIdentity, assertSavedPrMergeIdentity, resolvePrMergeBaseRepositoryUrl } from './pr-merge-identity.js';
 import { checkForkThreats, toPublicThreatCheckComment } from './threat-check.js';
+import { selectPullRequest, type PrSelectionResult } from './selection.js';
 import { toLocalBranchRef, toPullRequestBaseRef } from '../../shared/utils/gitBranchValidation.js';
 import { createLogger, getErrorMessage } from '../../shared/utils/index.js';
 import { runWorkflowExecution } from '../tasks/execute/workflowExecutionApi.js';
@@ -36,6 +37,8 @@ interface MergeOptions {
   readonly settings: MergeSettings;
   readonly concurrency: number;
   readonly prNumber?: number;
+  readonly selectionText?: string;
+  readonly onSelectionResult?: (results: readonly PrSelectionResult[]) => void;
   readonly workflow?: string;
   readonly where?: WorkflowPrListWhere;
   readonly includeDraft?: boolean;
@@ -322,8 +325,35 @@ export async function runMerge(
   const where = { ...(cliConditions ? options.where : options.settings.where) };
   const includeDraft = cliConditions ? options.includeDraft === true : options.settings.includeDraft;
   const includeForks = cliConditions ? options.includeForks === true : options.settings.includeForks;
-  const numbers = options.prNumber !== undefined ? [options.prNumber]
+  let numbers = options.prNumber !== undefined ? [options.prNumber]
     : dependencies.listOpenPrNumbers(options.projectCwd);
+  const matchesSelectionConditions = (pr: PrListItem): boolean => (includeDraft || !pr.draft)
+    && (includeForks || pr.same_repository === true) && matchesPrWhere(pr, where);
+  const selectionText = options.prNumber === undefined ? options.selectionText : undefined;
+  if (selectionText !== undefined) {
+    const results: PrSelectionResult[] = [];
+    for (const prNumber of numbers) {
+      options.abortSignal?.throwIfAborted();
+      const pr = dependencies.fetchPrListItem(prNumber, options.projectCwd);
+      if (pr === undefined || !matchesSelectionConditions(pr)) continue;
+      results.push(await selectPullRequest(pr, selectionText, options.projectCwd,
+        getGitProvider(), options.abortSignal));
+    }
+    numbers = results.filter((result) => result.selected).map((result) => result.number);
+
+    const eligibleNumbers: number[] = [];
+    for (const prNumber of numbers) {
+      options.abortSignal?.throwIfAborted();
+      const pr = dependencies.fetchPrListItem(prNumber, options.projectCwd);
+      if (pr !== undefined && matchesSelectionConditions(pr)) eligibleNumbers.push(prNumber);
+    }
+    numbers = eligibleNumbers;
+    const eligibleNumberSet = new Set(eligibleNumbers);
+    options.onSelectionResult?.(results.map((result) => ({
+      ...result,
+      selected: result.selected && eligibleNumberSet.has(result.number),
+    })));
+  }
   const workflow = options.workflow ?? options.settings.workflow;
   const running = new Set<Promise<void>>();
   let notifyCompletion: (() => void) | undefined;
@@ -347,7 +377,7 @@ export async function runMerge(
 
   try {
     for (const prNumber of numbers) {
-      if (options.prNumber === undefined) {
+      if (options.prNumber === undefined && selectionText === undefined) {
         let pr: PrListItem | undefined;
         try {
           pr = dependencies.fetchPrListItem(prNumber, options.projectCwd);
@@ -356,8 +386,7 @@ export async function runMerge(
           processedCount += 1;
           continue;
         }
-        if (pr === undefined || !((includeDraft || !pr.draft)
-          && (includeForks || pr.same_repository === true) && matchesPrWhere(pr, where))) continue;
+        if (pr === undefined || !matchesSelectionConditions(pr)) continue;
       }
       const execution = execute(prNumber).finally(() => {
         running.delete(execution);
