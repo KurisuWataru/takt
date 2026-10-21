@@ -38,6 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `takt merge` no longer treats an earlier GitHub Actions run on the same HEAD as a CI failure when it was cancelled by concurrency control and a later run of the same workflow succeeded. The earlier run is ignored only when the later run can be identified uniquely by repository, workflow, HEAD, and start time.
 - Upgrading a global install with `npm install --global takt` over an older version no longer leaves empty directories that made `takt` fail at startup with `Cannot find package .../string-width/index.js` (#1851). TAKT no longer depends on `update-notifier`.
 - `takt run` and `takt watch` no longer stop picking up tasks when the disk fills up while claiming pending tasks; they warn, retry every 5 seconds, and continue once space is available.
 - Creating a task clone no longer fails intermittently when Git garbage collection runs in the project repository at the same time.

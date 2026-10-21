@@ -38,6 +38,7 @@
 
 ### Fixed
 
+- `takt merge` で、同じ HEAD の古い GitHub Actions の run が並行実行制御でキャンセルされ、同じ workflow の後続の run が成功した場合に、CI 失敗として扱わないようにしました。リポジトリ、workflow、HEAD、開始時刻から後続の run を一意に特定できる場合だけ、古い run を除外します。
 - 古い版の上に `npm install --global takt` で上書きしたとき、空のディレクトリが残って `takt` が起動時に `Cannot find package .../string-width/index.js` で失敗する問題を修正しました (#1851)。TAKT は `update-notifier` に依存しなくなりました。
 - pending タスクの取得中にディスクがいっぱいになっても、`takt run` と `takt watch` がタスクの取得を止めないようにしました。警告を出して 5 秒ごとに再試行し、空きができたら再開します。
 - プロジェクトのリポジトリで Git のガベージコレクションが同時に動くと、タスクの clone 作成がまれに失敗する問題を修正しました。
