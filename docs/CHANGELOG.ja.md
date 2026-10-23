@@ -8,7 +8,7 @@
 
 ## [Unreleased]
 
-## [0.72.0] - 2026-10-22
+## [0.72.0] - 2026-10-23
 
 ### Added
 
@@ -19,8 +19,11 @@
 - DeepSeek Harness の plugin を npm パッケージから読み込めるようにしました。`provider_options.deepseek_harness.plugins` に文字列で `npm:<package-spec>` を書くか、オブジェクトの `source` に指定します(`id` と `config` は省略可)。パッケージは lifecycle scripts を実行せずに一時 runtime へインストールし、runtime の終了時に削除します。npm の source では `ref` と認証情報を含む URL を拒否します。信頼の規則は Git の plugin と同じです。@eiei114 さん、ありがとうございます。
 - workflow の step で `input_reports`(`from_step`、`reports`: 名前の一覧または `all`、`optional_if_unrun`)を宣言すると、同じ workflow の別 step の完了した実行からレポートを受け取れるようにしました。選んだレポートは `{report:name}` で参照でき、プレースホルダーのないものは Phase 1 の指示に追記します。レポートが見つからない、不完全、または特定できない場合は step を失敗させます。agent step、`workflow_call`、parallel の親と sub-step で使えます。
 
+- 静的な parallel の sub-step に `description` を書けるようにし、動的プールの候補には選ぶ基準を書く任意の `selection_hint` を追加しました。selector は両方を受け取ります。ビルトインの全 step に役目を説明する `description` を書き、セキュリティレビュアーの選択条件は `selection_hint` に移しました。
+
 ### Changed
 
+- `runtime.yaml` の profile(`provider.profiles`)で `model` を省略できるようにしました (#1856)。省略した場合は provider の CLI の既定モデルを使い、その step には優先度の低い model の設定を適用しません。OpenCode の profile では従来どおり `model` が必須です。
 - BREAKING: Caccia は workflow の `caccia` effect を明示したときだけ実行するようにしました (#1804)。push、タスク後の PR 作成・更新、Pipeline モードでは起動しなくなりました。`caccia.enabled` は effect が CodeRabbit を待つかどうかだけを決め、false または未設定なら effect はスキップされます。ビルトインの `merge-review`、`merge-review-fix`、`merge-review-fix-simple` は push のあとにこの effect を呼び、Caccia が返した head で CI を確認します。自動の CodeRabbit ループに頼っていた自作 workflow には `caccia` step を追加してください。実行前に、GitHub 上の PR の head が push したコミットに一致するまで最大 60 秒待ちます。
 - `merge-review-fix` と `merge-review-fix-simple` で、CI が失敗したときにコメントして止まるのではなく回復を試みるようにしました。読み取り専用の step が失敗したチェック、ジョブのログ、PR の累積差分、関連コードを調べます。フレークや main でも落ちる失敗を含むリポジトリの欠陥には、レビュー付きの根本修正を最大 2 周行います。証拠のある外部要因なら、失敗したジョブを 1 回だけ再実行します。証拠が足りない場合や回復の上限に達した場合は、回数、最後に失敗したチェック、調査の要点をコメントし、タスクを失敗として終えます(これまではコメント後に完了扱いでした)。workflow の部品として、system input の `pr_ci_failure`、effect の `rerun_ci`、`pr_status.rerun_from`、`comment_pr` の `body_format: plain_text` を追加しました。
 - アシスタントの会話の `/requeue` と `/retry` で、AI がタスクや開始位置を決められないときや選択に失敗したときは、通知して止まるのではなく一覧から選べるようにしました (#1863)。AI はまず会話で合意した内容を要約し、その要約、インラインの指示、workflow/step の完全なパスを使って選ぶので、同名の step も区別できます。AI の回答が不正なら 1 回だけ訂正を求め、それでも不正なら手動のメニューに理由を表示します。`/requeue` では、停止位置が保存されていない上限超過のタスクでも開始位置を選べます。
@@ -38,6 +41,7 @@
 
 ### Fixed
 
+- 同じセッションを引き継いだエージェントが、レポートや判定のフェーズの制限(ファイルを読まないなど)を次の作業フェーズにも持ち越してしまう問題を修正しました。システムプロンプトで workflow・step・フェーズの仕組みと、この run の workflow の木(現在の step 付き)を伝え、各フェーズの指示の先頭で、担当している step とフェーズ、そのフェーズでしてよいこと・しないことを伝えます。判定、レポートの書き直し、parallel の sub-step、team の part、loop monitor、selector にも同じ情報を渡します。
 - `takt merge` で、同じ HEAD の古い GitHub Actions の run が並行実行制御でキャンセルされ、同じ workflow の後続の run が成功した場合に、CI 失敗として扱わないようにしました。リポジトリ、workflow、HEAD、開始時刻から後続の run を一意に特定できる場合だけ、古い run を除外します。
 - 古い版の上に `npm install --global takt` で上書きしたとき、空のディレクトリが残って `takt` が起動時に `Cannot find package .../string-width/index.js` で失敗する問題を修正しました (#1851)。TAKT は `update-notifier` に依存しなくなりました。
 - pending タスクの取得中にディスクがいっぱいになっても、`takt run` と `takt watch` がタスクの取得を止めないようにしました。警告を出して 5 秒ごとに再試行し、空きができたら再開します。

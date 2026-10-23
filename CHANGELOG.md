@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.72.0] - 2026-10-22
+## [0.72.0] - 2026-10-23
 
 ### Added
 
@@ -19,8 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - DeepSeek Harness plugins can be loaded from npm packages. Write `npm:<package-spec>` as a string entry in `provider_options.deepseek_harness.plugins`, or as `source` in an object entry, where `id` and `config` are optional. Packages are installed into the temporary runtime without lifecycle scripts and removed when the runtime ends. `ref` and URLs containing credentials are rejected for npm sources. The same trust rules as Git plugins apply. Thanks to @eiei114.
 - Workflow steps can declare `input_reports` (`from_step`, `reports`: a list of names or `all`, `optional_if_unrun`) to receive reports from the completed run of another step in the same workflow. Selected reports are available through `{report:name}`, and selected reports without a placeholder are appended to the Phase 1 instruction. A missing, incomplete, or ambiguous report fails the step. This works on agent steps, `workflow_call`, and parallel parents and sub-steps.
 
+- Static parallel sub-steps accept `description`, and dynamic pool candidates accept an optional `selection_hint` with the criteria for selecting them. The selector receives both. Every builtin step now has a `description` of its role, and the security reviewer's selection criteria moved to `selection_hint`.
+
 ### Changed
 
+- Profiles in `runtime.yaml` (`provider.profiles`) may omit `model` (#1856). The provider then uses its CLI default model, and lower-priority model settings are not applied to that step. OpenCode profiles still require `model`.
 - BREAKING: Caccia now runs only from an explicit `caccia` workflow effect (#1804). Pushes, PR creation or update after a task, and Pipeline mode no longer start it. `caccia.enabled` now only decides whether the effect waits for CodeRabbit; when it is false or unset, the effect is skipped. The builtin `merge-review`, `merge-review-fix`, and `merge-review-fix-simple` workflows call it after each push and check CI on the head that Caccia returns. Custom workflows that relied on the automatic CodeRabbit loop must add a `caccia` step. Before running, the effect waits up to 60 seconds for the PR head on GitHub to match the pushed commit.
 - `merge-review-fix` and `merge-review-fix-simple` now try to recover from CI failures instead of commenting and stopping. A read-only step investigates the failed checks, job logs, the cumulative PR diff, and related code. A repository defect, including flaky tests and failures that also happen on main, gets at most two reviewed root-cause fix rounds. An evidenced external cause allows one rerun of the failed jobs. When evidence is insufficient or recovery is exhausted, the workflow comments with the counts, the last failed checks, and the investigation summary, and the task ends as failed (previously it completed after the comment). New workflow building blocks: the `pr_ci_failure` system input, the `rerun_ci` effect, `pr_status.rerun_from`, and `comment_pr` `body_format: plain_text`.
 - `/requeue` and `/retry` in assistant conversations let you choose the task or start position from a list when the AI cannot decide or its selection fails, instead of stopping with a notice (#1863). The AI first summarizes what the conversation agreed, then selects using that summary, the inline guidance, and full workflow/step paths so that steps with the same name can be told apart. An invalid AI answer is corrected once, and the manual menu then shows the reason. For `/requeue`, an exceeded task with no saved stopping position now offers a start-position choice.
@@ -38,6 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- An agent continuing the same session no longer carries a report or judgment phase's restrictions, such as not reading files, into its next work phase. The system prompt now explains how workflows, steps, and phases fit together and shows the run's workflow tree with the current step, and every phase instruction starts with the step and phase being handled and what that phase may and may not do. Judgments, report rewrites, parallel sub-steps, team parts, loop monitors, and selectors receive the same information.
 - `takt merge` no longer treats an earlier GitHub Actions run on the same HEAD as a CI failure when it was cancelled by concurrency control and a later run of the same workflow succeeded. The earlier run is ignored only when the later run can be identified uniquely by repository, workflow, HEAD, and start time.
 - Upgrading a global install with `npm install --global takt` over an older version no longer leaves empty directories that made `takt` fail at startup with `Cannot find package .../string-width/index.js` (#1851). TAKT no longer depends on `update-notifier`.
 - `takt run` and `takt watch` no longer stop picking up tasks when the disk fills up while claiming pending tasks; they warn, retry every 5 seconds, and continue once space is available.
