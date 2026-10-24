@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Restored automatic Caccia after successful PR creation or update by worktree `auto_pr` tasks and Pipeline `--auto-pr` when `caccia.enabled` is true. Explicit Caccia effects in the executed workflow or an automatically started merge workflow suppress post-processing Caccia; otherwise it finishes before merge starts. Git push itself does not start Caccia.
+
 ## [0.72.0] - 2026-10-23
 
 ### Added

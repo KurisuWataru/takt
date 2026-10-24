@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- worktree の `auto_pr` タスクと Pipeline の `--auto-pr` で PR を正常に作成・更新した後、`caccia.enabled` が true なら Caccia を自動実行するように戻しました。実行した workflow または自動で始まる merge workflow に Caccia effect が明示されている場合は、後処理での Caccia を抑止します。そうでなければ merge 開始前に Caccia を完了します。Git push 自体では Caccia を開始しません。
+
 ## [0.72.0] - 2026-10-23
 
 ### Added
