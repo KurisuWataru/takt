@@ -25,6 +25,10 @@ export function keepsOpenCodeAllowedToolWithoutEdit(tool: string): boolean {
  * which MCP tools are trusted is decided before reaching this helper.
  */
 export function toOpenCodeMcpToolName(tool: string): string | undefined {
+  const serverGrant = /^mcp__([A-Za-z0-9_.-]+)$/.exec(tool.trim());
+  if (serverGrant && !serverGrant[1]!.includes('__') && !serverGrant[1]!.endsWith('_')) {
+    return `${serverGrant[1]!.replace(/[^a-zA-Z0-9_-]/g, '_')}_*`;
+  }
   const parsed = parseMcpToolName(tool.trim());
   if (parsed === undefined || !/^[A-Za-z0-9_-]+$/.test(parsed.toolName)) {
     return undefined;

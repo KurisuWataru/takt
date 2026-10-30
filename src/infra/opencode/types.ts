@@ -68,7 +68,8 @@ function isPermissionAllowedByRuleset(
 
   return ruleset.some((rule) => (
     rule.action === 'allow'
-    && (rule.permission === permission || rule.permission === '*')
+    && (rule.permission === permission || rule.permission === '*'
+      || (rule.permission.endsWith('_*') && permission.startsWith(rule.permission.slice(0, -1))))
   ));
 }
 

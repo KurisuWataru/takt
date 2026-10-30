@@ -6,6 +6,7 @@ import { createMcpAdapter, type ResolvedMcpServers, type ProviderMcpContext } fr
 import { TAKT_MANAGER_MCP_SERVER_NAME } from '../features/manager/managerMcp.js';
 import { TAKT_MCP_MANAGER_TOOL_NAMES } from '../features/mcp/server.js';
 import { createTaskStateMcpServers } from '../features/interactive/taskStateMcp.js';
+import { markConversationMcpServers } from '../infra/providers/mcp/task-state.js';
 
 /**
  * Contracts covered (see plan.md 完了契約):
@@ -348,6 +349,16 @@ describe('Copilot adapter (MCP-COPILOT)', () => {
       serverNames: Object.keys(copiedServers),
       identity: 'takt:stdio',
     }, baseContext({ permissionMode: 'readonly', taskStateMcpServers }))).rejects.toThrow(/readonly permission mode/);
+  });
+
+  it('accepts a registered conversation record but rejects its copy in Copilot readonly mode', async () => {
+    const adapter = createMcpAdapter('copilot');
+    const servers = markConversationMcpServers({ backlog: { command: 'backlog' }, ...createTaskStateMcpServers() });
+    const resolved = { enabled: true, servers, serverNames: Object.keys(servers), identity: 'conversation' };
+    const context = baseContext({ permissionMode: 'readonly' });
+    const prepared = await adapter.prepare(resolved, context);
+    await prepared.dispose();
+    await expect(adapter.prepare({ ...resolved, servers: { ...servers } }, context)).rejects.toThrow(/readonly permission mode/);
   });
 
   it('Given the copilot adapter with edit permission mode, When prepared with servers, Then --additional-mcp-config is added (permission-consistent)', async () => {

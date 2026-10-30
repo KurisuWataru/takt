@@ -18,7 +18,7 @@ import type {
 } from './types.js';
 import { isStdioServer } from './types.js';
 import { validateTransports, onceDispose, noopDispose, classifyMcpFailure } from './adapter.js';
-import { isTrustedTaskStateMcpServers } from './task-state.js';
+import { isTrustedConversationMcpServers, isTrustedTaskStateMcpServers } from './task-state.js';
 import { ensureCurrentTmpDirExists } from '../../../shared/utils/index.js';
 
 export function createCopilotMcpAdapter(): ProviderMcpAdapter {
@@ -33,13 +33,13 @@ export function createCopilotMcpAdapter(): ProviderMcpAdapter {
       if (!servers.enabled || Object.keys(servers.servers).length === 0) {
         return { dispose: noopDispose, args: [] };
       }
-      // MCP tool approval must not contradict TAKT's permission mode
-      // (order.md:220). A readonly execution must not enable MCP servers
-      // because MCP tools can have side effects the permission mode forbids.
+      // Only conversation-owned records and the generated task-state record
+      // may bypass the general readonly restriction.
       const hasTrustedTaskStateServers = context.permissionMode === 'readonly'
         && context.taskStateMcpServers === servers.servers
         && isTrustedTaskStateMcpServers(context.taskStateMcpServers);
-      if (context.permissionMode === 'readonly' && !hasTrustedTaskStateServers) {
+      if (context.permissionMode === 'readonly' && !hasTrustedTaskStateServers
+        && !isTrustedConversationMcpServers(servers.servers)) {
         throw new Error(
           'Copilot MCP adapter cannot prepare MCP servers under readonly permission mode: MCP tools may have side effects that contradict the permission mode (order.md:220)',
         );
