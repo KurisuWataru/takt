@@ -1101,6 +1101,8 @@ describe('providerOptionsContract', () => {
       'provider_options.claude.skills.enabled',
       'provider_options.claude.sandbox.allow_unsandboxed_commands',
       'provider_options.claude.sandbox.excluded_commands',
+      'provider_options.claude.permissions.deny',
+      'provider_options.claude.permissions.import_user_read_deny',
       'provider_options.claude_terminal.backend',
       'provider_options.claude_terminal.guards.call_timeout_ms',
       'provider_options.claude_terminal.timeout_ms',

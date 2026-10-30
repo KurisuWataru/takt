@@ -107,6 +107,13 @@ export interface ClaudeSandboxSettings {
   excludedCommands?: string[];
 }
 
+export interface ClaudePermissionsOptions {
+  /** Claude に渡す permissions.deny の規則。 */
+  deny?: string[];
+  /** true のとき、~/.claude/settings.json の permissions.deny から Read( で始まる規則を取り込む。 */
+  importUserReadDeny?: boolean;
+}
+
 export interface ClaudeSkillOptions {
   enabled?: boolean;
 }
@@ -117,6 +124,7 @@ export interface ClaudeProviderOptions {
   effort?: ClaudeEffort;
   skills?: ClaudeSkillOptions;
   sandbox?: ClaudeSandboxSettings;
+  permissions?: ClaudePermissionsOptions;
   guards?: ProviderGuardOptions;
 }
 

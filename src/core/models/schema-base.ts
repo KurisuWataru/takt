@@ -65,6 +65,11 @@ const ClaudeSandboxShape = {
 /** Claude sandbox settings schema */
 export const ClaudeSandboxSchema = z.object(ClaudeSandboxShape).optional();
 
+const ClaudePermissionsShape = {
+  deny: z.array(z.string().min(1)).optional(),
+  import_user_read_deny: z.boolean().optional(),
+};
+
 /** Provider-specific step options schema */
 const CodexSkillsShape = {
   repo: z.boolean().optional(),
@@ -137,6 +142,7 @@ const ClaudeProviderOptionShape = {
   effort: ProviderEffortSchema.optional(),
   skills: ClaudeSkillsSchema.optional(),
   sandbox: z.object(ClaudeSandboxShape).optional(),
+  permissions: z.object(ClaudePermissionsShape).optional(),
   guards: ProviderGuardOptionsSchema.optional(),
 };
 
@@ -145,6 +151,7 @@ const ClaudeProviderOptionsSchema = z.object(ClaudeProviderOptionShape);
 const StrictClaudeProviderOptionsSchema = z.object({
   ...ClaudeProviderOptionShape,
   sandbox: z.object(ClaudeSandboxShape).strict().optional(),
+  permissions: z.object(ClaudePermissionsShape).strict().optional(),
 }).strict();
 
 const ClaudeTerminalProviderOptionsSchema = z.object({
@@ -676,6 +683,10 @@ const NormalizedStepProviderOptionsSchema = z.object({
     sandbox: z.object({
       allowUnsandboxedCommands: z.boolean().optional(),
       excludedCommands: z.array(z.string()).optional(),
+    }).strict().optional(),
+    permissions: z.object({
+      deny: z.array(z.string().min(1)).optional(),
+      importUserReadDeny: z.boolean().optional(),
     }).strict().optional(),
   }).strict().optional(),
   claudeTerminal: z.object({

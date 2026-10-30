@@ -413,6 +413,8 @@ events continue to arrive. Raise the limit with
 profiles and per-model overrides are described in
 [Provider inactivity deadline and OpenCode execution guards](./docs/configuration.md#provider-inactivity-deadline-and-opencode-execution-guards).
 
+To keep Claude from reading secret files, `provider_options.claude.permissions.deny` passes `permissions.deny` rules to `claude-sdk` and `claude-headless`. Set `provider_options.claude.permissions.import_user_read_deny: true` to also import the `Read(` rules from `~/.claude/settings.json`. Neither key is set by default, and `claude-terminal` is not affected. See [Claude Code read-deny rules](./docs/configuration.md#claude-read-deny-rules).
+
 ### Dedicated provider configuration (`runtime.yaml`)
 
 You can keep provider, model, and routing settings in `~/.takt/runtime.yaml`
