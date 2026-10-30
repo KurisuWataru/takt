@@ -73,7 +73,7 @@ function toOpenCodeOptions(options: ProviderCallOptions): OpenCodeCallOptions {
     if (tool !== 'Read') throw new Error(`OpenCode strict tool allowlist does not support: ${tool}`);
     return true;
   });
-  const allowedMcpTools = (strictTools ?? options.preparedMcp?.taskStateMcpTools)
+  const allowedMcpTools = (strictTools ?? options.preparedMcp?.conversationMcpTools)
     ?.map(toOpenCodeMcpToolName)
     .filter((tool): tool is string => tool !== undefined);
   if (options.imageAttachments && options.imageAttachments.length > 0) {

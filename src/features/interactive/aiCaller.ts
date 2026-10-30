@@ -17,7 +17,7 @@ import { AGENT_FAILURE_CATEGORIES } from '../../shared/types/agent-failure.js';
 import type { ProviderType } from '../../infra/providers/index.js';
 import { getProvider } from '../../infra/providers/index.js';
 import { createMcpAdapter, type PreparedProviderMcp, type ResolvedMcpServers } from '../../infra/providers/mcp/index.js';
-import { resolveTrustedTaskStateMcpAllowedTools } from '../../infra/providers/mcp/task-state.js';
+import { resolveTrustedTaskStateMcpAllowedTools, resolveTrustedTaskStateMcpToolNames } from '../../infra/providers/mcp/task-state.js';
 import { buildMcpServerSetIdentity } from '../../infra/config/runtime-provider/mcp-schema.js';
 import type { ImageAttachmentReference } from '../../shared/types/image-attachments.js';
 import type { InternalAgentIsolation, StreamCallback, StreamEvent } from '../../shared/types/provider.js';
@@ -187,6 +187,24 @@ function resolveConversationMcpServers(
   };
 }
 
+function resolveConversationMcpPermissions(ctx: SessionContext): {
+  tools: readonly string[];
+  userServerNames: readonly string[];
+  builtinToolNames: readonly string[];
+} | undefined {
+  const builtinTools = resolveTrustedTaskStateMcpAllowedTools(ctx.taskStateMcpServers);
+  const builtinToolNames = resolveTrustedTaskStateMcpToolNames(ctx.taskStateMcpServers);
+  if (builtinTools === undefined || builtinToolNames === undefined
+    || ctx.mcpServers === undefined || ctx.taskStateMcpServers === undefined
+    || ctx.mcpServers.takt !== ctx.taskStateMcpServers.takt) return undefined;
+  const userServerNames = Object.keys(ctx.mcpServers).filter((name) => name !== 'takt');
+  return {
+    tools: [...builtinTools, ...userServerNames.map((name) => `mcp__${name}`)],
+    userServerNames,
+    builtinToolNames,
+  };
+}
+
 async function prepareConversationMcp(
   ctx: SessionContext,
   cwd: string,
@@ -196,19 +214,21 @@ async function prepareConversationMcp(
 ): Promise<{ readonly servers: ResolvedMcpServers; readonly prepared: PreparedProviderMcp } | undefined> {
   const adapter = createMcpAdapter(ctx.providerType);
   adapter.validate(servers);
+  const permissions = resolveConversationMcpPermissions(ctx);
   const prepared = await adapter.prepare(servers, {
     cwd,
     abortSignal,
     ...(permissionMode === undefined ? {} : { permissionMode }),
+    ...(permissions === undefined ? {} : {
+      approvedServerNames: permissions.userServerNames,
+      toolApprovalAllowlist: { takt: permissions.builtinToolNames },
+    }),
     ...(ctx.taskStateMcpServers === servers.servers
       ? { taskStateMcpServers: ctx.taskStateMcpServers }
       : {}),
   });
-  const taskStateMcpTools = ctx.taskStateMcpServers === servers.servers
-    ? resolveTrustedTaskStateMcpAllowedTools(ctx.taskStateMcpServers)
-    : undefined;
-  if (taskStateMcpTools !== undefined) {
-    prepared.taskStateMcpTools = taskStateMcpTools;
+  if (permissions !== undefined) {
+    prepared.conversationMcpTools = permissions.tools;
   }
   return { servers, prepared };
 }
@@ -322,18 +342,16 @@ export async function callAIWithRetry(
     const promptForProvider = ctx.provider.supportsNativeImageInput
       ? prompt
       : expandImageAttachmentPlaceholders(prompt, options.imageAttachments);
-    const taskStateMcpTools = options.internalAgentIsolation === 'strict-readonly'
+    const conversationMcpTools = options.internalAgentIsolation === 'strict-readonly'
       ? undefined
-      : ctx.mcpServers === ctx.taskStateMcpServers
-        ? resolveTrustedTaskStateMcpAllowedTools(ctx.taskStateMcpServers)
-        : undefined;
+      : resolveConversationMcpPermissions(ctx)?.tools;
     const allowedToolsForProvider = ctx.providerType === 'deepseek-harness'
       ? allowedTools
       : providerSupportsAllowedTools(ctx.providerType) === false
         ? undefined
-        : taskStateMcpTools === undefined
+        : conversationMcpTools === undefined
           ? allowedTools
-          : [...new Set([...(allowedTools ?? []), ...taskStateMcpTools])];
+          : [...new Set([...(allowedTools ?? []), ...conversationMcpTools])];
     // Per-call permissionMode is used for operations with a dedicated constraint; a session-level
     // mode is resolved user configuration and must still reach the provider for explicit-constraint errors.
     const permissionModeForProvider = ctx.providerType !== 'deepseek-harness'

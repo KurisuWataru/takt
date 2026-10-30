@@ -12,6 +12,7 @@ import {
   resolveOpenCodePermissionReply,
 } from '../infra/opencode/types.js';
 import { toOpenCodeMcpToolName } from '../infra/opencode/allowedTools.js';
+import { toV2Tools } from '../infra/opencode/v2-contract.js';
 import type { PermissionMode } from '../core/models/index.js';
 
 describe('mapToOpenCodePermissionReply', () => {
@@ -90,6 +91,23 @@ describe('resolveOpenCodePermissionReply', () => {
 });
 
 describe('OpenCode permissions', () => {
+  it.each(['backlog', 'takt-full'])(
+    'allows every tool of the assigned server %s while denying other MCP tools', (server) => {
+      const permission = toOpenCodeMcpToolName(`mcp__${server}`);
+      expect(permission).toBe(`${server}_*`);
+      if (permission === undefined) throw new Error('The assigned MCP server was not converted');
+      const rules = buildOpenCodePermissionRuleset(undefined, undefined, ['Read'], [permission]);
+      for (const name of ['get_issue', 'add_issue', 'takt_enqueue_goal_task']) {
+        expect(resolveOpenCodePermissionReply(undefined, `${server}_${name}`, rules)).toBe('once');
+      }
+      for (const name of ['other_get_issue', 'takt_takt_enqueue_goal_task', `${server}x_get_issue`, `${server}-other_get_issue`, server]) {
+        expect(resolveOpenCodePermissionReply(undefined, name, rules)).toBe('reject');
+      }
+      const tools = buildOpenCodePromptTools(undefined, undefined, ['Read'], [permission]);
+      expect(tools[permission]).toBe(true);
+      expect(toV2Tools(tools)[permission]).toBe(true);
+    },
+  );
   it('limits strict session, prompt and permission replies to read and the named MCP tools', () => {
     const mcpTools = ['takt_create_goal', 'takt_list_goals', 'takt_get_goal', 'takt_list_tasks', 'takt_get_run'].map((name) => `takt_${name}`);
     const strictTools = ['Read', ...mcpTools];

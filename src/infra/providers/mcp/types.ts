@@ -25,6 +25,8 @@ export interface ProviderMcpContext {
   cwd: string;
   /** Session-local tools explicitly approved by the conversation owner. */
   toolApprovalAllowlist?: Readonly<Record<string, readonly string[]>>;
+  /** Conversation-owned servers whose tools are all approved. */
+  approvedServerNames?: readonly string[];
   abortSignal?: AbortSignal;
   /** Optional source path for error messages (e.g. `<project>/.takt/runtime.yaml`). */
   sourcePath?: string;
@@ -70,8 +72,8 @@ export interface PreparedProviderMcp {
   serverConfig?: Record<string, unknown>;
   /** Identity of the resolved set (for shared server pool isolation). */
   identity?: string;
-  /** Trusted task-state MCP tools allowed for this prepared server set. */
-  taskStateMcpTools?: readonly string[];
+  /** MCP tools and server grants allowed for this conversation. */
+  conversationMcpTools?: readonly string[];
   /** Isolated workspace config root (Cursor). */
   configRoot?: string;
   /** Resolved server set for test inspection (Mock). */
