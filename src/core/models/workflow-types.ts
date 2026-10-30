@@ -50,6 +50,7 @@ export type {
   ClaudeEffort,
   CopilotEffort,
   ClaudeSandboxSettings,
+  ClaudePermissionsOptions,
   ProviderGuardOptions,
   CodexProviderOptions,
   CodexPermissionControl,
