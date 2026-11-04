@@ -65,6 +65,11 @@ const ClaudeSandboxShape = {
 /** Claude sandbox settings schema */
 export const ClaudeSandboxSchema = z.object(ClaudeSandboxShape).optional();
 
+const ClaudePermissionsShape = {
+  deny: z.array(z.string().min(1)).optional(),
+  import_user_read_deny: z.boolean().optional(),
+};
+
 /** Provider-specific step options schema */
 const CodexSkillsShape = {
   repo: z.boolean().optional(),
@@ -137,6 +142,7 @@ const ClaudeProviderOptionShape = {
   effort: ProviderEffortSchema.optional(),
   skills: ClaudeSkillsSchema.optional(),
   sandbox: z.object(ClaudeSandboxShape).optional(),
+  permissions: z.object(ClaudePermissionsShape).optional(),
   guards: ProviderGuardOptionsSchema.optional(),
 };
 
@@ -145,6 +151,7 @@ const ClaudeProviderOptionsSchema = z.object(ClaudeProviderOptionShape);
 const StrictClaudeProviderOptionsSchema = z.object({
   ...ClaudeProviderOptionShape,
   sandbox: z.object(ClaudeSandboxShape).strict().optional(),
+  permissions: z.object(ClaudePermissionsShape).strict().optional(),
 }).strict();
 
 const ClaudeTerminalProviderOptionsSchema = z.object({
@@ -160,12 +167,21 @@ const CopilotProviderOptionsSchema = z.object({
   guards: ProviderGuardOptionsSchema.optional(),
 });
 
+const KiroEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max'], {
+  error: (issue) => `Invalid Kiro effort ${JSON.stringify(issue.input)}; expected low, medium, high, xhigh, or max`,
+});
+
 const KiroProviderOptionsSchema = z.object({
   agent: z.string().min(1).optional(),
+  effort: KiroEffortSchema.optional(),
   guards: ProviderGuardOptionsSchema.optional(),
 });
 
 const CursorProviderOptionsSchema = z.object({
+  guards: ProviderGuardOptionsSchema.optional(),
+});
+
+const DevinProviderOptionsSchema = z.object({
   guards: ProviderGuardOptionsSchema.optional(),
 });
 
@@ -234,6 +250,7 @@ export const StepProviderOptionsObjectSchema = z.object({
   kiro: KiroProviderOptionsSchema.optional(),
   pi: PiProviderOptionsSchema.optional(),
   deepseek_harness: DeepSeekHarnessProviderOptionsSchema.optional(),
+  devin: DevinProviderOptionsSchema.optional(),
 });
 
 export const StepProviderOptionsSchema = StepProviderOptionsObjectSchema.optional();
@@ -248,6 +265,7 @@ const StrictStepProviderOptionsSchema = z.object({
   kiro: KiroProviderOptionsSchema.strict().optional(),
   pi: PiProviderOptionsSchema.strict().optional(),
   deepseek_harness: DeepSeekHarnessProviderOptionsSchema.strict().optional(),
+  devin: DevinProviderOptionsSchema.strict().optional(),
 }).strict().optional();
 
 /** Provider key schema for profile maps */
@@ -446,6 +464,7 @@ export const ProviderPermissionProfilesSchema = z.object({
   kiro: ProviderPermissionProfileSchema.optional(),
   pi: ProviderPermissionProfileSchema.optional(),
   'deepseek-harness': ProviderPermissionProfileSchema.optional(),
+  devin: ProviderPermissionProfileSchema.optional(),
   mock: ProviderPermissionProfileSchema.optional(),
 }).strict().optional();
 
@@ -677,6 +696,10 @@ const NormalizedStepProviderOptionsSchema = z.object({
       allowUnsandboxedCommands: z.boolean().optional(),
       excludedCommands: z.array(z.string()).optional(),
     }).strict().optional(),
+    permissions: z.object({
+      deny: z.array(z.string().min(1)).optional(),
+      importUserReadDeny: z.boolean().optional(),
+    }).strict().optional(),
   }).strict().optional(),
   claudeTerminal: z.object({
     backend: z.enum(['tmux']).optional(),
@@ -695,11 +718,17 @@ const NormalizedStepProviderOptionsSchema = z.object({
   }).strict().optional(),
   kiro: z.object({
     agent: z.string().min(1).optional(),
+    effort: KiroEffortSchema.optional(),
     guards: z.object({
       callTimeoutMs: z.number().int().min(60_000).max(86_400_000).optional(),
     }).strict().optional(),
   }).strict().optional(),
   cursor: z.object({
+    guards: z.object({
+      callTimeoutMs: z.number().int().min(60_000).max(86_400_000).optional(),
+    }).strict().optional(),
+  }).strict().optional(),
+  devin: z.object({
     guards: z.object({
       callTimeoutMs: z.number().int().min(60_000).max(86_400_000).optional(),
     }).strict().optional(),
