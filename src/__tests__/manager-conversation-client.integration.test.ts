@@ -1,35 +1,47 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { connectConversationIpc } from '../features/daemon/conversationReadiness.js';
+import { ConversationStateStore } from '../infra/daemon/conversationStateStore.js';
+import * as daemonFiles from '../infra/daemon/privateFile.js';
+import { mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import * as net from 'node:net';
 import { createElement } from 'react';
 import { cleanup, render } from 'ink-testing-library';
 import { ManagerView } from '../features/manager/ManagerView.js';
 import * as selectionDialog from '../features/manager/ManagerSelectionDialog.js';
-import * as summaryDialog from '../features/manager/ManagerSummaryDialog.js';
+import * as transcriptView from '../features/tui/TranscriptEntryView.js';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ConversationIpcClient } from '../features/manager/conversationIpcClient.js';
+import { ConversationTransferReceiver } from '../features/manager/conversationTransferReceiver.js';
 import * as frames from '../features/daemon/conversationFrames.js';
 import * as goalService from '../infra/goals/service.js';
-import type { SnapshotRead } from '../features/manager/conversationPort.js';
+import type { ConversationDelivery, SnapshotItem, SnapshotRead } from '../features/manager/conversationPort.js';
+import { invalidateResolvedConfigCache } from '../infra/config/resolveConfigValue.js';
+import * as privateFiles from '../shared/utils/private-file.js';
+import { answerInquiry, createInquiry } from '../infra/goals/inquiry.js';
 import { createConversationIpcServer } from '../features/daemon/conversationIpcServer.js';
-import { createConversationService } from '../features/manager/conversationService.js';
+import { conversationDaemon } from './helpers/conversation-daemon.js';
 import { createTuiConversationPort } from '../features/manager/tuiConversationPort.js';
-import { ConversationStore } from '../infra/conversations/store.js';
 import { getGlobalConfigDir } from '../infra/config/paths.js';
-import { writeDaemonOwner } from '../infra/daemon/owner.js';
-import { conversationRecord } from './helpers/conversation-fixtures.js';
+import { removeDaemonOwner, writeDaemonOwner } from '../infra/daemon/owner.js';
+import { writeLegacyConversation, conversationRecord } from './helpers/conversation-fixtures.js';
 import { goalRecord } from './helpers/goal-fixtures.js';
 import { askTaktGoalQuestion } from '../features/mcp/goalQuestionOperations.js';
 import { GoalStore } from '../infra/goals/store.js';
-import { saveManagerToolPermissionInquiry } from '../features/manager/toolPermissionInquiry.js';
 import { StandaloneInquiryStore } from '../infra/goals/standalone-inquiries.js';
 import type { ManagerAssignment } from '../features/manager/startupResolution.js';
 import type { Goal } from '../infra/goals/schema.js';
+import { formatGoalNotification } from '../infra/goals/notifications.js';
 import type { ManagerTurnInput } from '../features/manager/turnExecutor.js';
 import { getLabel } from '../shared/i18n/index.js';
+import { createManagerTurnExecutor } from '../features/manager/turnExecutor.js';
+import { makeProvider } from './test-helpers.js';
+import type { ProviderAgent } from '../infra/providers/types.js';
+import { deferred, humanTurnText } from './helpers/daemon-turn.js';
+import { measureWidth } from '../shared/utils/grapheme.js';
 
 const doubles = vi.hoisted(() => ({ assignment: vi.fn(), resolve: vi.fn(), ensure: vi.fn(), plan: vi.fn() }));
+vi.mock('node:net', async (original) => ({ ...await original<typeof import('node:net')>() }));
 vi.mock('../features/daemon/lifecycle.js', () => ({ ensureDaemon: doubles.ensure }));
 vi.mock('../infra/daemon/owner.js', async (original) => ({ ...await original<typeof import('../infra/daemon/owner.js')>(), isDaemonOwnerRunning: () => true }));
 vi.mock('../features/manager/assignment.js', async (original) => ({ ...await original<typeof import('../features/manager/assignment.js')>(),
@@ -38,38 +50,734 @@ vi.mock('../infra/task/repositoryDirectory.js', async (original) => ({ ...await 
   resolveGitRepositoryDirectory: async (path: string) => path }));
 vi.mock('../infra/task/runner.js', () => ({ TaskRunner: class { listTaskStateItems() { return []; } } }));
 vi.mock('../features/manager/conversationPlan.js', () => ({ createManagerConversationPlan: doubles.plan }));
+vi.mock('../features/tui/TranscriptEntryView.js', async (original) => {
+  const actual = await original<typeof import('../features/tui/TranscriptEntryView.js')>();
+  return { ...actual, TranscriptView: vi.fn((props: Parameters<typeof actual.TranscriptView>[0]) =>
+    createElement(actual.TranscriptView, props)) };
+});
 
 let directory: string;
 let repository: string;
 let assignment: ManagerAssignment;
 let server: Awaited<ReturnType<typeof createConversationIpcServer>>;
-let service: ReturnType<typeof createConversationService>;
+let fixture: Awaited<ReturnType<typeof conversationDaemon>>;
+let service: Awaited<ReturnType<typeof conversationDaemon>>['input'];
 let client: ConversationIpcClient;
 const owner = { pid: process.pid, identity: { startTime: 'client-integration-owner' }, version: 'test', cliPath: '/test/cli.js' };
 // 再接続待ち（500ms）と再読込を挟む待機があるため、既定の 1 秒では負荷時に足りない。
 function waitFor<T>(callback: () => T | Promise<T>): Promise<T> { return vi.waitFor(callback, { timeout: 5_000 }); }
 const execute = vi.fn(async (input: ManagerTurnInput) => ({ message: 'finished', summary: null, sessionId: 'session', assignment: input.assignment }));
-function saveGoal(goal: Goal) {
-  const path = join(repository, '.takt', 'goals', goal.id);
+function saveGoal(goal: Goal, goalRepository = repository) {
+  const path = join(goalRepository, '.takt', 'goals', goal.id);
   mkdirSync(path, { recursive: true }); writeFileSync(join(path, 'goal.json'), JSON.stringify(goal));
 }
 beforeEach(async () => {
   vi.clearAllMocks();
+  doubles.ensure.mockReset().mockImplementation(async () => {
+    const socket = await connectConversationIpc(directory, owner);
+    if (socket === undefined) throw new Error('Daemon IPC readiness failed');
+    return socket;
+  });
+  vi.stubEnv('COLUMNS', '100'); vi.stubEnv('LINES', '24');
   doubles.plan.mockReturnValue({ ctx: { providerType: 'mock' } });
   directory = getGlobalConfigDir(); repository = join(directory, 'repository'); mkdirSync(repository, { recursive: true });
   assignment = { kind: 'repository', repositoryDirectory: repository, repositoryDirectories: [repository] };
   doubles.assignment.mockResolvedValue(assignment);
   const selected = await createTuiConversationPort(directory, { deliver: async () => ({ kind: 'delivered' }) }).resolve(assignment);
   const record = conversationRecord(repository); record.bindings = [selected.binding];
-  new ConversationStore(directory).write(record);
+  writeLegacyConversation(directory, record);
   doubles.resolve.mockResolvedValue({ provider: 'mock', model: null, language: 'en', contextKey: 'test', executor: { execute } });
-  service = createConversationService({ configDirectory: directory, owner, onDomainChange: vi.fn(), runtime: { resolve: doubles.resolve, close: async () => {} } });
-  writeDaemonOwner(directory, owner);
+  fixture = await conversationDaemon(directory, { resolve: doubles.resolve, close: async () => {} });
+  service = fixture.input;
+  await writeDaemonOwner(directory, owner);
   server = await createConversationIpcServer(directory, owner, service);
   client = new ConversationIpcClient(assignment, { provider: 'mock', model: 'chosen-model' });
 });
-afterEach(async () => { cleanup(); client.close(); await service.close(); await server.close(); vi.restoreAllMocks(); });
-async function complete() { await waitFor(() => expect(client.getSnapshot().readStatus).toBe('complete')); }
+afterEach(async () => { cleanup(); client.close(); await fixture.close(); await server.close(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+async function complete() { await vi.waitFor(() => expect(client.getSnapshot().readStatus).toBe('complete'), { timeout: 10_000 }); }
+
+it('refreshes human merge wait and ongoing counts through IPC when finishing work runs, fails and is retried', async () => {
+  const goal: Goal = { ...goalRecord(), status: 'awaiting_merge', completion: {
+    goalBranch: goalRecord().branch, goalSha: 'a'.repeat(40), targetBranch: 'main', summary: 'verified', instructions: [],
+    changeSummary: { filesChanged: 0, additions: 0, deletions: 0, files: [], truncated: false, totalsTruncated: false },
+  } };
+  saveGoal(goal);
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const check = async (awaiting: boolean) => {
+    await waitFor(() => {
+      expect(displayedGoals(client)).toMatchObject([{ id: goal.id, awaitingHumanMerge: awaiting }]);
+      expect(app.lastFrame()).toContain(getLabel('manager.counts', 'en', {
+        goals: awaiting ? '0' : '1', awaiting: awaiting ? '1' : '0', questions: '0',
+      }));
+    });
+  };
+  await check(true);
+  for (const { statuses, awaiting } of [
+    { statuses: ['pending'], awaiting: false },
+    { statuses: ['running'], awaiting: false },
+    { statuses: ['failed'], awaiting: false },
+    { statuses: ['exceeded'], awaiting: false },
+    { statuses: ['pr_failed'], awaiting: false },
+    { statuses: ['failed', 'pending'], awaiting: false },
+    { statuses: ['failed', 'completed'], awaiting: true },
+  ]) {
+    writeFileSync(join(repository, '.takt', 'tasks.yaml'), JSON.stringify({ tasks: statuses.map((status, index) => ({
+      name: `finishing-work-${index}`, goal_id: goal.id, merge_task: true, status,
+      created_at: '2026-11-08T00:00:00.000Z', started_at: null, completed_at: null,
+    })) }));
+    await client.refresh(); await complete();
+    await check(awaiting);
+  }
+});
+
+it.each([false, true])('delivers Bash descriptions and ordered text through IPC with final JSON streamed=%s without saving transient output or sending it to Slack', async (streamFinal) => {
+  const prose = 'コードを読んでいるところです。';
+  const useTool = deferred<void>();
+  const respond = deferred<void>();
+  const finish = deferred<void>();
+  const call = vi.fn<ProviderAgent['call']>(async (_prompt, options) => {
+    options.onStream!({ type: 'thinking', data: { thinking: 'private-reasoning-marker' } });
+    options.onStream!({ type: 'thinking', data: { thinking: 'private-reasoning-marker' } });
+    await useTool.promise;
+    options.onStream!({ type: 'text', data: { text: prose.slice(0, 7) } });
+    options.onStream!({ type: 'text', data: { text: prose.slice(7) } });
+    options.onStream!({ type: 'tool_use', data: { id: 'activity-tool', tool: 'Bash', input: {
+      description: '見回りの予定のコードを読む', command: 'private-input-marker', timeout: 1000,
+    } } });
+    await respond.promise;
+    options.onStream!({ type: 'tool_result', data: { id: 'activity-tool', content: 'private-result-marker', isError: false } });
+    options.onStream!({ type: 'text', data: { text: '調べがつきました。' } });
+    await finish.promise;
+    const structuredOutput = { message: 'Final activity reply', summary: null };
+    if (streamFinal) options.onStream!({ type: 'text', data: { text: JSON.stringify(structuredOutput) } });
+    return { persona: 'manager', status: 'done',
+      content: `${prose}\n調べがつきました。\n${JSON.stringify(structuredOutput)}`,
+      timestamp: new Date(), structuredOutput };
+  });
+  const executor = createManagerTurnExecutor(repository, {
+    ctx: { providerType: 'mock', lang: 'en', model: undefined, provider: makeProvider({ setup: () => ({ call }) }) },
+    strategy: { systemPrompt: 'manager' },
+  });
+  doubles.resolve.mockResolvedValue({ provider: 'mock', model: null, language: 'en', contextKey: 'activity', executor });
+  const outputs = vi.fn();
+  client.onOutput(outputs);
+  const writes = vi.spyOn(daemonFiles, 'writePrivateFile');
+  const savedResults = vi.spyOn(fixture.events, 'saveResult');
+  await client.connect(); await complete();
+  const selected = await createTuiConversationPort(directory, { deliver: async () => ({ kind: 'delivered' }) }).resolve(assignment);
+  const slack = { deliver: vi.fn<ConversationDelivery['deliver']>(async () => ({ kind: 'delivered' })) };
+  const slackOpen = await service.open({ ...selected, binding: { ...selected.binding, port: 'slack' } }, slack);
+  slackOpen.read.cancel();
+  const app = await snapshotView();
+  const transcript = () => vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+  const activities = () => outputs.mock.calls.map(([value]) => value).filter((value) => value.kind === 'activity');
+  await waitFor(() => expect(transcript()).toHaveLength(1));
+  const initialEntries = [...transcript()];
+  try {
+    expect(await client.submit({ kind: 'message', text: 'Show activity' })).toMatchObject({ kind: 'accepted' });
+    await waitFor(() => expect(app.lastFrame()).toContain(getLabel('tui.ui.extendedThinking', 'en')));
+    expect(transcript()).toEqual([...initialEntries, { role: 'user', content: 'Show activity' }]);
+    useTool.resolve();
+    await waitFor(() => expect(app.lastFrame()).toContain('見回りの予定のコードを読む'));
+    const activityRow = app.lastFrame()!.split('\n').find((row) => row.includes('見回りの予定のコードを読む'))!;
+    expect(activityRow).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 見回りの予定のコードを読む.*\b\d+s\b/u);
+    expect(measureWidth(activityRow)).toBeLessThanOrEqual(80);
+    expect(transcript()).toEqual([...initialEntries, { role: 'user', content: 'Show activity' },
+      { role: 'assistant', content: prose }]);
+    const beforeTool = outputs.mock.calls.map(([output]) => output);
+    const beforeIndex = beforeTool.findIndex((output) => output.message === prose);
+    expect(beforeIndex).toBeGreaterThanOrEqual(0);
+    expect(beforeIndex).toBeLessThan(beforeTool.findIndex((output) => output.kind === 'activity' && output.activity.kind === 'tool'));
+    // A periodic snapshot must not clear the active tool from the same running turn.
+    await client.refresh(); await complete();
+    expect(app.lastFrame()).toContain('見回りの予定のコードを読む');
+    respond.resolve();
+    await waitFor(() => expect(app.lastFrame()).toContain(getLabel('tui.ui.responding', 'en')));
+    finish.resolve();
+    await fixture.settled();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain('Final activity reply');
+      expect(app.lastFrame()).not.toContain('見回りの予定のコードを読む');
+      expect(app.lastFrame()).not.toContain(getLabel('tui.ui.responding', 'en'));
+    });
+    expect(activities()[0].activity).toEqual({ kind: 'thinking' });
+    expect(activities().filter((output) => output.activity.kind === 'tool').map((output) => output.activity)).toEqual([
+      { kind: 'tool', tool: 'Bash', description: '見回りの予定のコードを読む' },
+    ]);
+    expect(activities().at(-1).activity).toEqual({ kind: 'responding' });
+    expect(transcript()).toEqual([...initialEntries, { role: 'user', content: 'Show activity' },
+      { role: 'assistant', content: prose },
+      { role: 'assistant', content: 'Final activity reply' }]);
+    const delivered = outputs.mock.calls.map(([output]) => output);
+    expect(delivered.filter((output) => output.kind === 'turn_text').map((output) => output.message)).toEqual([
+      prose,
+    ]);
+    expect(delivered.filter((output) => output.kind === 'result')).toHaveLength(1);
+    const finalIndex = delivered.findIndex((output) => output.kind === 'result' && output.result.message === 'Final activity reply');
+    const textIndex = delivered.findIndex((output) => output.message === prose);
+    expect(textIndex).toBeGreaterThanOrEqual(0);
+    expect(textIndex).toBeLessThan(finalIndex);
+    const transientKinds = new Set(delivered.filter((output) =>
+      [prose, '調べがつきました。'].includes(output.message)).map((output) => output.kind));
+    const slackOutputs = slack.deliver.mock.calls.map((args) => args[1]);
+    expect(slackOutputs).toContainEqual(expect.objectContaining({ kind: 'result', result: { kind: 'reply', message: 'Final activity reply' } }));
+    for (const output of slackOutputs) {
+      expect(output).not.toMatchObject({ kind: 'activity' });
+      expect(transientKinds.has(output.kind)).toBe(false);
+      const json = JSON.stringify(output);
+      for (const transient of ['見回りの予定のコードを読む', prose, '調べがつきました。']) expect(json).not.toContain(transient);
+    }
+    const read = await fixture.dispatcher.snapshot(client.getSnapshot().state!.conversationId);
+    const items = [];
+    for await (const item of read.items) items.push(item);
+    read.cancel();
+    for (const persisted of [writes.mock.calls, savedResults.mock.calls, items, client.getSnapshot()]) {
+      const json = JSON.stringify(persisted);
+      for (const transient of ['見回りの予定のコードを読む', prose, '調べがつきました。']) expect(json).not.toContain(transient);
+      expect(json).not.toContain('private-');
+      JSON.parse(json, (key, value: unknown) => {
+        expect(key).not.toBe('activity');
+        return value;
+      });
+    }
+    expect(JSON.stringify(outputs.mock.calls)).not.toContain('private-');
+  } finally { useTool.resolve(); respond.resolve(); finish.resolve(); await fixture.settled(); service.detach(slackOpen.attachmentId); }
+});
+
+it('does not transfer text after interruption during its conversation read', async () => {
+  const controller = new AbortController();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const outputs = vi.fn(); client.onOutput(outputs);
+  await client.connect(); await complete();
+  const conversationId = client.getSnapshot().state!.conversationId;
+  const read = fixture.store.read.bind(fixture.store);
+  vi.spyOn(fixture.store, 'read').mockImplementationOnce(async (id) => {
+    entered.resolve(); await release.promise; return read(id);
+  });
+  const progress = fixture.conversations.progress({ conversationId, operationId: randomUUID(), generation: 1 },
+    { kind: 'turn_text', message: '本文を配送しない' }, controller.signal);
+  try {
+    await entered.promise;
+    controller.abort();
+    release.resolve(); await progress;
+    expect(outputs.mock.calls.filter(([output]) => output.kind === 'turn_text')).toEqual([]);
+  } finally { release.resolve(); await progress; }
+});
+
+it('suppresses patrol text while showing its Bash description and elapsed time on the connected screen', async () => {
+  const finish = deferred<void>();
+  const goal: Goal = { ...goalRecord(), executionStatus: 'active' };
+  saveGoal(goal);
+  const call = vi.fn<ProviderAgent['call']>(async (_prompt, options) => {
+    options.onStream!({ type: 'text', data: { text: '見回りの途中の文' } });
+    options.onStream!({ type: 'tool_use', data: { id: 'patrol', tool: 'Bash', input: { description: '見回りの状態を調べる' } } });
+    await finish.promise;
+    options.onStream!({ type: 'text', data: { text: '見回りの終了前の文' } });
+    return { persona: 'manager', status: 'done', content: '', timestamp: new Date(), structuredOutput: { message: 'Patrol final reply', summary: null } };
+  });
+  const executor = createManagerTurnExecutor(repository, { ctx: { providerType: 'mock', lang: 'en', model: undefined,
+    provider: makeProvider({ setup: () => ({ call }) }) }, strategy: { systemPrompt: 'manager' } });
+  doubles.resolve.mockResolvedValue({ provider: 'mock', model: null, language: 'en', contextKey: 'patrol-text', executor });
+  const outputs = vi.fn(); client.onOutput(outputs);
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  try {
+    expect(await fixture.dispatcher.accept({ conversationId: client.getSnapshot().state!.conversationId,
+      eventId: randomUUID(), requestId: randomUUID(), source: 'daemon', occurredAt: new Date().toISOString(),
+      event: { kind: 'patrol', repositoryDirectory: repository, goalIds: [goal.id] } })).toMatchObject({ kind: 'accepted' });
+    await waitFor(() => expect(call).toHaveBeenCalledOnce());
+    await waitFor(() => {
+      const row = app.lastFrame()!.split('\n').find((line) => line.includes('見回りの状態を調べる'));
+      expect(row).toBeDefined();
+      expect(row).toMatch(/\b\d+s\b/u);
+    });
+    finish.resolve(); await fixture.settled();
+    await waitFor(() => expect(app.lastFrame()).toContain('Patrol final reply'));
+    const transcript = vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+    for (const message of ['見回りの途中の文', '見回りの終了前の文']) {
+      expect(outputs.mock.calls.map(([output]) => output.message)).not.toContain(message);
+      expect(transcript.map((entry) => entry.content)).not.toContain(message);
+    }
+  } finally { finish.resolve(); await fixture.settled(); }
+});
+
+it('keeps already displayed text but suppresses buffered and late text after interruption of the same turn', async () => {
+  const finish = deferred<void>();
+  const call = vi.fn<ProviderAgent['call']>(async (_prompt, options) => {
+    options.onStream!({ type: 'text', data: { text: '中断前に表示する文' } });
+    options.onStream!({ type: 'tool_use', data: { id: 'before', tool: 'Bash', input: {} } });
+    options.onStream!({ type: 'text', data: { text: '中断時に未確定の文' } });
+    await finish.promise;
+    options.onStream!({ type: 'tool_use', data: { id: 'after', tool: 'Read', input: {} } });
+    options.onStream!({ type: 'text', data: { text: '中断後に届く文' } });
+    return { persona: 'manager', status: 'done', content: '', timestamp: new Date(), structuredOutput: { message: 'Cancelled final reply', summary: null } };
+  });
+  const executor = createManagerTurnExecutor(repository, { ctx: { providerType: 'mock', lang: 'en', model: undefined,
+    provider: makeProvider({ setup: () => ({ call }) }) }, strategy: { systemPrompt: 'manager' } });
+  doubles.resolve.mockResolvedValue({ provider: 'mock', model: null, language: 'en', contextKey: 'interrupt-text', executor });
+  const outputs = vi.fn(); client.onOutput(outputs);
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const transcript = () => vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+  try {
+    expect(await client.submit({ kind: 'message', text: 'Interrupt the running turn' })).toMatchObject({ kind: 'accepted' });
+    await waitFor(() => expect(transcript()).toContainEqual({ role: 'assistant', content: '中断前に表示する文' }));
+    const running = client.getSnapshot().state!.running!;
+    expect(await client.submit({ kind: 'abort_turn', operationId: running.operationId, generation: running.generation! })).toMatchObject({ kind: 'accepted' });
+    const deliveredBefore = outputs.mock.calls.length;
+    finish.resolve(); await fixture.settled();
+    await waitFor(() => expect(client.getSnapshot().state?.running).toBeNull());
+    expect(transcript()).toContainEqual({ role: 'assistant', content: '中断前に表示する文' });
+    for (const message of ['中断時に未確定の文', '中断後に届く文', 'Cancelled final reply']) {
+      expect(transcript().map((entry) => entry.content)).not.toContain(message);
+      expect(outputs.mock.calls.slice(deliveredBefore).map(([output]) => output.message)).not.toContain(message);
+    }
+    expect(app.lastFrame()).toContain('中断前に表示する文');
+  } finally { finish.resolve(); await fixture.settled(); }
+});
+
+it.each([false, true])('displays next-turn text once after an interrupted turn with its running state delayed=%s', async (delayed) => {
+  const finishFirst = deferred<void>();
+  const emitText = deferred<void>();
+  const finishNext = deferred<void>();
+  const reading = deferred<void>();
+  const releaseRunning = deferred<void>();
+  const message = '次のターンを調べています。';
+  execute.mockImplementationOnce(async (input) => {
+    input.onText!('中断前に表示する文');
+    await finishFirst.promise;
+    return { message: 'Interrupted reply', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  execute.mockImplementationOnce(async (input) => {
+    await emitText.promise;
+    input.onText!(message);
+    await finishNext.promise;
+    return { message: 'Next turn completed', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  const outputs = vi.fn(); client.onOutput(outputs);
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const transcript = () => vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+  const textEntries = () => transcript().filter((entry) => entry.role === 'assistant' && entry.content === message);
+  try {
+    await client.submit({ kind: 'message', text: 'Start the first turn' });
+    await waitFor(() => {
+      expect(client.getSnapshot().state?.running).not.toBeNull();
+      expect(transcript()).toContainEqual({ role: 'assistant', content: '中断前に表示する文' });
+    });
+    const first = client.getSnapshot().state!.running!;
+    expect(await client.submit({ kind: 'abort_turn', operationId: first.operationId, generation: first.generation! })).toMatchObject({ kind: 'accepted' });
+    finishFirst.resolve(); await fixture.settled();
+    await waitFor(() => expect(client.getSnapshot().state).toMatchObject({ running: null, interrupted: true }));
+    await waitFor(() => expect(app.lastFrame()).toContain('Turn interrupted'));
+
+    const snapshot = fixture.dispatcher.snapshot.bind(fixture.dispatcher);
+    vi.spyOn(fixture.dispatcher, 'snapshot').mockImplementationOnce(async (id) => {
+      const read = await snapshot(id);
+      reading.resolve();
+      await releaseRunning.promise;
+      return read;
+    });
+    const accepted = await client.submit({ kind: 'message', text: 'Start the next turn' });
+    expect(accepted.kind).toBe('accepted');
+    if (accepted.kind !== 'accepted') throw new Error('Turn was not accepted');
+    await reading.promise;
+    if (!delayed) {
+      releaseRunning.resolve();
+      await waitFor(() => expect(client.getSnapshot().state?.running?.operationId).toBe(accepted.operationId));
+    }
+    emitText.resolve();
+    await waitFor(() => expect(outputs).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'turn_text', operationId: accepted.operationId, message,
+    })));
+    if (delayed) expect(client.getSnapshot().state).toMatchObject({ running: null, interrupted: true });
+    await waitFor(() => expect(textEntries()).toEqual([{ role: 'assistant', content: message }]));
+    releaseRunning.resolve();
+    await waitFor(() => expect(client.getSnapshot().state?.running?.operationId).toBe(accepted.operationId));
+    expect(textEntries()).toHaveLength(1);
+    finishNext.resolve(); await fixture.settled();
+    await waitFor(() => expect(app.lastFrame()).toContain('Next turn completed'));
+    expect(textEntries()).toHaveLength(1);
+    expect(transcript()).toContainEqual({ role: 'assistant', content: '中断前に表示する文' });
+    expect(transcript().findIndex((entry) => entry.content === message))
+      .toBeLessThan(transcript().findIndex((entry) => entry.content === 'Next turn completed'));
+  } finally {
+    finishFirst.resolve(); emitText.resolve(); releaseRunning.resolve(); finishNext.resolve(); await fixture.settled();
+  }
+});
+
+it.each([false, true])('preserves next-turn text while settling with a snapshot before text delivery=%s', async (refreshBeforeText) => {
+  const finishFirst = deferred<void>();
+  const emitText = deferred<void>();
+  const finishNext = deferred<void>();
+  const deliveringText = deferred<void>();
+  const releaseText = deferred<void>();
+  const finished = deferred<void>();
+  const message = '次のターンを調べています。';
+  execute.mockImplementationOnce(async (input) => {
+    input.onText!('中断前に表示する文');
+    await finishFirst.promise;
+    return { message: 'Interrupted reply', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  execute.mockImplementationOnce(async (input) => {
+    await emitText.promise;
+    input.onText!(message);
+    await finishNext.promise;
+    return { message: 'Next turn completed', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  const outputs = vi.fn(); client.onOutput(outputs);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const transcript = () => vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+  const assistantEntries = () => transcript().filter((entry) => entry.role === 'assistant');
+  await waitFor(() => expect(assistantEntries()).toHaveLength(1));
+  const initialEntries = [...assistantEntries()];
+  const id = client.getSnapshot().state!.conversationId;
+  const readState = async () => {
+    const read = await fixture.dispatcher.snapshot(id);
+    try {
+      for await (const item of read.items) {
+        if (item.kind === 'state') return { operationId: read.operationId, state: item.state };
+      }
+      throw new Error('Snapshot state was not delivered');
+    } finally { read.cancel(); }
+  };
+  try {
+    await client.submit({ kind: 'message', text: 'Start the first turn' });
+    await waitFor(() => {
+      expect(client.getSnapshot().state?.running).not.toBeNull();
+      expect(assistantEntries()).toEqual([...initialEntries, { role: 'assistant', content: '中断前に表示する文' }]);
+    });
+    const first = client.getSnapshot().state!.running!;
+    expect(await client.submit({ kind: 'abort_turn', operationId: first.operationId, generation: first.generation! })).toMatchObject({ kind: 'accepted' });
+    finishFirst.resolve(); await fixture.settled();
+    await waitFor(() => expect(client.getSnapshot().state).toMatchObject({ running: null, interrupted: true }));
+    await waitFor(() => expect(app.lastFrame()).toContain('Turn interrupted'));
+    expect((await readState()).state).toMatchObject({ running: null, interrupted: true });
+
+    const deliver = service.deliver.bind(service);
+    vi.spyOn(service, 'deliver').mockImplementation(async (conversationId, output, version, signal) => {
+      if (output.kind === 'turn_text' && output.message === message) {
+        deliveringText.resolve();
+        await releaseText.promise;
+      }
+      await deliver(conversationId, output, version, signal);
+    });
+    const post = fixture.dispatcher.post.bind(fixture.dispatcher);
+    vi.spyOn(fixture.dispatcher, 'post').mockImplementation((event) => {
+      const pending = post(event);
+      if (event.kind === 'turn_finished') finished.resolve();
+      return pending;
+    });
+    const apply = vi.spyOn(fixture.conversations, 'apply');
+    const accepted = await client.submit({ kind: 'message', text: 'Start the next turn' });
+    expect(accepted.kind).toBe('accepted');
+    if (accepted.kind !== 'accepted') throw new Error('Turn was not accepted');
+    await waitFor(() => expect(client.getSnapshot().state).toMatchObject({
+      running: { operationId: accepted.operationId }, interrupted: false,
+    }));
+    const started = await readState();
+    expect(started.operationId).toBe(accepted.operationId);
+    emitText.resolve();
+    await deliveringText.promise;
+    finishNext.resolve();
+    await finished.promise;
+    const settling = await readState();
+    expect(settling).toMatchObject({ operationId: null, state: { running: { operationId: accepted.operationId } } });
+    expect(apply).not.toHaveBeenCalled();
+    expect(outputs).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'turn_text', message }));
+    expect(assistantEntries()).toEqual([...initialEntries, { role: 'assistant', content: '中断前に表示する文' }]);
+    if (refreshBeforeText) await refreshSnapshot(client, connections[0]!);
+    const beforeText = client.getSnapshot().state!;
+    releaseText.resolve();
+    await waitFor(() => expect(outputs).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'turn_text', operationId: accepted.operationId, message,
+    })));
+    await fixture.settled();
+    await waitFor(() => expect(app.lastFrame()).toContain('Next turn completed'));
+    if (!refreshBeforeText) await refreshSnapshot(client, connections[0]!);
+    expect({
+      startedInterrupted: started.state.interrupted,
+      settlingInterrupted: settling.state.interrupted,
+      clientBeforeText: { operationId: beforeText.running?.operationId ?? null, interrupted: beforeText.interrupted },
+      entries: assistantEntries(),
+    }).toEqual({
+      startedInterrupted: false,
+      settlingInterrupted: false,
+      clientBeforeText: { operationId: refreshBeforeText ? null : accepted.operationId, interrupted: false },
+      entries: [
+        ...initialEntries,
+        { role: 'assistant', content: '中断前に表示する文' },
+        { role: 'assistant', content: message },
+        { role: 'assistant', content: 'Next turn completed' },
+      ],
+    });
+    expect(outputs.mock.calls.filter(([output]) => output.kind === 'turn_text' && output.message === message)).toHaveLength(1);
+    expect(client.getSnapshot().state).toMatchObject({ running: null, interrupted: false });
+  } finally {
+    finishFirst.resolve(); emitText.resolve(); finishNext.resolve(); releaseText.resolve(); await fixture.settled();
+  }
+});
+
+it('shows the latest early activity when a connected TUI finally receives the delayed running state', async () => {
+  const reading = deferred<void>();
+  const releaseRunning = deferred<void>();
+  const finish = deferred<void>();
+  const outputs = vi.fn(); client.onOutput(outputs);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const observed = vi.fn();
+  const receiver = new ConversationTransferReceiver(client.getSnapshot().state!.conversationId, {
+    state: vi.fn(), item: vi.fn(), remove: vi.fn(), output: observed, read: vi.fn(),
+  });
+  receiver.authenticated();
+  const decoder = new frames.ConversationFrameDecoder();
+  const transfers = new Set<string>();
+  connections[0]!.socket.on('data', (chunk: Buffer) => {
+    for (const frame of decoder.decode(chunk)) {
+      const envelope = frame as { output?: { kind: string; purpose?: string; transferId: string } };
+      const output = envelope.output;
+      if (output === undefined) continue;
+      if (output.kind === 'transfer_start' && output.purpose === 'output') transfers.add(output.transferId);
+      if (transfers.has(output.transferId)) receiver.receive(frame);
+      if (output.kind === 'transfer_end' || output.kind === 'transfer_error') transfers.delete(output.transferId);
+    }
+  });
+  const snapshot = fixture.dispatcher.snapshot.bind(fixture.dispatcher);
+  vi.spyOn(fixture.dispatcher, 'snapshot').mockImplementationOnce(async (id) => {
+    const read = await snapshot(id);
+    reading.resolve();
+    await releaseRunning.promise;
+    return read;
+  });
+  execute.mockImplementationOnce(async (input) => {
+    input.onActivity!({ kind: 'thinking' });
+    input.onActivity!({ kind: 'tool', tool: 'EarlyTool' });
+    await finish.promise;
+    return { message: 'Early activity turn completed', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  try {
+    const accepted = await client.submit({ kind: 'message', text: 'Start with delayed running' });
+    expect(accepted.kind).toBe('accepted');
+    if (accepted.kind !== 'accepted') throw new Error('Turn was not accepted');
+    await reading.promise;
+    await waitFor(() => expect(observed).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'activity', activity: { kind: 'tool', tool: 'EarlyTool' },
+    }), expect.anything()));
+    expect(client.getSnapshot().state!.running).toBeNull();
+    expect(outputs.mock.calls.filter(([output]) => output.kind === 'activity')).toEqual([]);
+    expect(app.lastFrame()).not.toContain('EarlyTool');
+
+    releaseRunning.resolve();
+
+    await waitFor(() => expect(app.lastFrame()).toContain('EarlyTool'));
+    expect(outputs.mock.calls.filter(([output]) => output.kind === 'activity')).toEqual([[expect.objectContaining({
+      operationId: accepted.operationId, activity: { kind: 'tool', tool: 'EarlyTool' },
+    })]]);
+    finish.resolve();
+    await fixture.settled();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain('Early activity turn completed');
+      expect(app.lastFrame()).not.toContain('EarlyTool');
+    });
+  } finally { releaseRunning.resolve(); finish.resolve(); await fixture.settled(); }
+});
+
+it('restores current activity for a late TUI and after reconnect, then forgets it when the turn ends', async () => {
+  const finish = deferred<void>();
+  const readingThinking = deferred<void>();
+  const releaseThinking = deferred<void>();
+  let holdThinking = false;
+  const read = fixture.store.read.bind(fixture.store);
+  vi.spyOn(fixture.store, 'read').mockImplementation(async (id) => {
+    if (holdThinking) {
+      holdThinking = false;
+      readingThinking.resolve();
+      await releaseThinking.promise;
+    }
+    return read(id);
+  });
+  execute.mockImplementationOnce(async (input) => {
+    holdThinking = true;
+    input.onActivity!({ kind: 'thinking' });
+    input.onActivity!({ kind: 'tool', tool: 'ReconnectTool' });
+    await finish.promise;
+    return { message: 'Reconnected turn completed', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const beforeTurn = Date.now();
+  await client.submit({ kind: 'message', text: 'Start before attaching' });
+  await fixture.executing(1);
+  await readingThinking.promise;
+  await waitFor(() => expect(client.getSnapshot().state?.running?.startedAt).toBeGreaterThanOrEqual(beforeTurn));
+  const startedAt = client.getSnapshot().state!.running!.startedAt;
+  expect(startedAt).toBeLessThanOrEqual(Date.now());
+  client.close();
+  client = new ConversationIpcClient(assignment, { provider: 'mock' });
+  const outputs = vi.fn();
+  client.onOutput(outputs);
+  const activities = () => outputs.mock.calls.map(([output]) => output).filter((output) => output.kind === 'activity');
+  try {
+    await client.connect(); await complete();
+    expect(client.getSnapshot().state?.running?.startedAt).toBe(startedAt);
+    await waitFor(() => expect(activities()).toHaveLength(1));
+    expect(activities()[0]).toMatchObject({ activity: { kind: 'tool', tool: 'ReconnectTool' } });
+    releaseThinking.resolve();
+    await fixture.dispatcher.drain();
+    expect(activities()).toHaveLength(1);
+    // 接続完了後にマウントしても、初期配送の現在値を表示できる。
+    const app = await snapshotView();
+    await waitFor(() => expect(app.lastFrame()).toContain('ReconnectTool'));
+    await client.refresh(); await complete();
+    expect(client.getSnapshot().state?.running?.startedAt).toBe(startedAt);
+    expect(activities()).toHaveLength(1);
+    connections[1]!.socket.destroy();
+    await waitFor(() => expect(activities()).toHaveLength(2));
+    await waitFor(() => {
+      expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' });
+      expect(client.getSnapshot().state?.running?.startedAt).toBe(startedAt);
+      expect(app.lastFrame()).toContain('ReconnectTool');
+    });
+    finish.resolve();
+    await fixture.settled();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain('Reconnected turn completed');
+      expect(app.lastFrame()).not.toContain('ReconnectTool');
+    });
+    connections[2]!.socket.destroy();
+    await waitFor(() => expect(connections).toHaveLength(4));
+    await waitFor(() => expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' }));
+    expect(activities()).toHaveLength(2);
+    expect(app.lastFrame()).not.toContain('ReconnectTool');
+  } finally { releaseThinking.resolve(); finish.resolve(); await fixture.settled(); }
+});
+
+it('restores cached activity after an initial transfer fails and a snapshot retry succeeds', async () => {
+  const finish = deferred<void>();
+  execute.mockImplementationOnce(async (input) => {
+    input.onActivity!({ kind: 'tool', tool: 'RetriedTool' });
+    await finish.promise;
+    return { message: 'Retried turn completed', summary: null, sessionId: 'session', assignment: input.assignment };
+  });
+  const originalOutputs = vi.fn();
+  client.onOutput(originalOutputs);
+  await client.connect(); await complete();
+  await client.submit({ kind: 'message', text: 'Start before failed attachment' });
+  try {
+    await waitFor(() => expect(originalOutputs).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'activity', activity: { kind: 'tool', tool: 'RetriedTool' },
+    })));
+    client.close();
+    const write = frames.writeConversationFrame;
+    let failed = false;
+    vi.spyOn(frames, 'writeConversationFrame').mockImplementation(async (socket, value) => {
+      const envelope = value as { output?: { kind: string } };
+      if (!failed && envelope.output?.kind === 'transfer_end') {
+        failed = true;
+        throw new Error('Initial snapshot write failed');
+      }
+      return write(socket, value);
+    });
+    client = new ConversationIpcClient(assignment, { provider: 'mock' });
+    const outputs = vi.fn();
+    client.onOutput(outputs);
+    await client.connect();
+    await waitFor(() => expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'incomplete' }));
+    expect(outputs).not.toHaveBeenCalled();
+    await client.refresh(); await complete();
+    await waitFor(() => expect(outputs).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      kind: 'activity', activity: { kind: 'tool', tool: 'RetriedTool' },
+    })));
+    const app = await snapshotView();
+    await waitFor(() => expect(app.lastFrame()).toContain('RetriedTool'));
+    await client.refresh(); await complete();
+    expect(outputs).toHaveBeenCalledOnce();
+    finish.resolve();
+    await fixture.settled();
+    await waitFor(() => {
+      expect(app.lastFrame()).toContain('Retried turn completed');
+      expect(app.lastFrame()).not.toContain('RetriedTool');
+    });
+  } finally { finish.resolve(); await fixture.settled(); }
+});
+
+it('shows a goal event reply once while connected and does not copy it to workLog', async () => {
+  const goal = goalRecord();
+  saveGoal(goal);
+  const message = 'Goal event reply';
+  execute.mockResolvedValueOnce({ message, summary: null, sessionId: 'event-session', assignment });
+  const connections = observeIpcConnections();
+  const outputs = vi.fn();
+  client.onOutput(outputs);
+  await client.connect(); await complete();
+  await snapshotView();
+  const observation = connections[0]!;
+  const previous = observation.snapshots.length;
+  const refreshMarker = 'Goal notification after connecting';
+  // スナップショットの転送と、その内容の画面への反映を両方待つための通知。
+  saveGoal({ ...goal, notifications: [{ id: randomUUID(), kind: 'custom', body: refreshMarker, recordedAt: new Date().toISOString() }] });
+
+  expect(await fixture.dispatcher.accept({ eventId: randomUUID(), requestId: randomUUID(),
+    conversationId: conversationRecord(repository).id, source: 'daemon', occurredAt: new Date().toISOString(),
+    event: { kind: 'goal_registered', repositoryDirectory: repository, goalId: goal.id } })).toMatchObject({ kind: 'accepted' });
+  await fixture.settled();
+  await waitFor(() => expect(outputs).toHaveBeenCalledWith(expect.objectContaining({ kind: 'result', result: { kind: 'reply', message } })));
+  await waitFor(() => {
+    expect(observation.snapshots.length).toBeGreaterThan(previous);
+    expect(observation.snapshots.at(-1)!.complete).toBe(true);
+  });
+  await waitFor(() => {
+    const entries = vi.mocked(transcriptView.TranscriptView).mock.lastCall![0].entries;
+    expect(entries.some((entry) => entry.content.includes(refreshMarker))).toBe(true);
+    expect(entries.filter((entry) => entry.content.includes(message))).toHaveLength(1);
+  });
+  expect((await new GoalStore(repository).get(goal.id)).workLog).toEqual([]);
+  expect(execute).toHaveBeenCalledOnce();
+});
+
+it.each([
+  { size: 'short', text: 'Keep reading while this request is admitted' },
+  { size: 'larger than an input batch', text: 'x'.repeat(16 * 1024) },
+])('starts both snapshots independently while a $size message response is pending', async ({ text }) => {
+  const second = new ConversationIpcClient(assignment, { provider: 'mock' });
+  const pendingReads: Promise<SnapshotRead>[] = [];
+  try {
+    await client.connect(); await complete(); await second.connect();
+    await vi.waitFor(() => expect(second.getSnapshot().readStatus).toBe('complete'));
+    const released = gate(); const submitted = gate(); const readsEntered = gate();
+    let reads = 0;
+    vi.spyOn(service, 'submit').mockImplementationOnce(async () => {
+      submitted.release(); await released.promise;
+      return { kind: 'accepted', operationId: randomUUID() };
+    });
+    const snapshot = service.snapshot.bind(service);
+    vi.spyOn(service, 'snapshot').mockImplementation((id) => {
+      const reading = snapshot(id).then(async (read) => {
+        if (++reads >= 2) readsEntered.release();
+        await released.promise; return read;
+      });
+      pendingReads.push(reading); return reading;
+    });
+    try {
+      const message = client.submit({ kind: 'message', text });
+      await submitted.promise;
+      const snapshots = [client.refresh(), second.refresh()];
+      await readsEntered.promise;
+      released.release();
+      await expect(Promise.all([message, ...snapshots])).resolves.toEqual([
+        { kind: 'accepted', operationId: expect.any(String) }, undefined, undefined,
+      ]);
+    } finally { released.release(); }
+    await complete();
+    expect(second.getSnapshot().connection).toBe('connected');
+  } finally { await Promise.allSettled(pendingReads); second.close(); }
+});
+
 function gate() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => { release = resolve; });
@@ -78,16 +786,64 @@ function gate() {
 
 function heldRead(read: SnapshotRead, entered: ReturnType<typeof gate>, released: ReturnType<typeof gate>): SnapshotRead {
   return { ...read, items: (async function* () {
+    let held = false;
     for await (const item of read.items) {
       yield item;
-      if (item.kind === 'state') { entered.release(); await released.promise; }
+      if (!held) { held = true; entered.release(); await released.promise; }
     }
+    if (!held) { entered.release(); await released.promise; }
   })() };
 }
 
+function captureAndStopPolling() {
+  const intervals = vi.spyOn(globalThis, 'setInterval');
+  return async () => {
+    await vi.waitFor(() => expect(intervals.mock.calls.some(([, milliseconds]) => milliseconds === 500)).toBe(true));
+    for (const [index, [, milliseconds]] of intervals.mock.calls.entries()) {
+      if (milliseconds === 500) clearInterval(intervals.mock.results[index]!.value as ReturnType<typeof setInterval>);
+    }
+  };
+}
+
+it('connects to the current daemon when the previous daemon stops during assignment resolution', async () => {
+  client.close();
+  let expired = false;
+  let restarted = false;
+  const port = createTuiConversationPort(directory, { deliver: async () => ({ kind: 'unavailable', reason: 'IPC only' }) });
+  doubles.ensure.mockImplementationOnce(async () => {
+    if (expired) {
+      await writeDaemonOwner(directory, owner);
+      server = await createConversationIpcServer(directory, owner, service);
+      restarted = true;
+    }
+    const socket = await connectConversationIpc(directory, owner);
+    if (socket === undefined) throw new Error('Daemon IPC readiness failed');
+    return socket;
+  });
+  client = new ConversationIpcClient(assignment, undefined, { reconnect: false, port: { ...port, async resolve(selected) {
+    const resolved = await port.resolve(selected);
+    await server.close();
+    await removeDaemonOwner(directory, owner, { signal: new AbortController().signal, timeoutMs: 5000 });
+    expired = true;
+    return resolved;
+  } } });
+  try {
+    await client.connect();
+    await complete();
+    expect(client.getSnapshot()).toMatchObject({ connection: 'connected', state: { pending: { revision: 4 } } });
+    expect(execute).not.toHaveBeenCalled();
+  } finally {
+    if (expired && !restarted) {
+      await writeDaemonOwner(directory, owner);
+      server = await createConversationIpcServer(directory, owner, service);
+    }
+  }
+});
+
 it('regenerates with /make-goal on the same screen and registers the new proposal only with Up and Enter', async () => {
+  const outputs: unknown[] = []; client.onOutput((output) => outputs.push(output));
   const summary = { objective: 'Replacement JSON export', outOfScope: ['CSV'], acceptanceCriteria: ['JSON exists'], constraints: [] };
-  const generate = vi.fn(async () => ({ message: 'Replacement ready', summary, sessionId: 'session', assignment }));
+  const generate = vi.fn(async (_input: ManagerTurnInput) => ({ message: 'Replacement ready', summary, sessionId: 'session', assignment }));
   doubles.resolve.mockResolvedValue({ provider: 'mock', model: null, language: 'en', contextKey: 'test', executor: { execute: generate } });
   const registration = vi.spyOn(goalService, 'registerReservedGoal');
   await client.connect(); await complete();
@@ -102,18 +858,23 @@ it('regenerates with /make-goal on the same screen and registers the new proposa
   }
   app.stdin.write('\r');
   await waitFor(() => expect(submissions.mock.calls.map(([command]) => command)).toEqual([
-    { kind: 'message', text: getLabel('manager.goSummaryRequest', 'en') },
+    { kind: 'message', text: getLabel('manager.goSummaryRequest', 'en'), display: false },
   ]));
+  await expect(submissions.mock.results[0]!.value).resolves.toMatchObject({ kind: 'accepted' });
+  await fixture.settled();
+  expect(generate).toHaveBeenCalledOnce();
+  await waitFor(() => expect(outputs).toContainEqual(expect.objectContaining({ kind: 'result', result: { kind: 'reply', message: 'Replacement ready' } })));
   await waitFor(() => {
-    expect(app.lastFrame()).toContain(summary.objective);
-    expect(app.lastFrame()).not.toContain('CSV出力');
+    expect(client.getSnapshot().state).toMatchObject({ pending: { revision: 5, summary }, approval: null, running: null });
+    expect(app.lastFrame()!.split(summary.objective)).toHaveLength(2);
+    expect(app.lastFrame()!.split('CSV出力')).toHaveLength(2);
     expect(client.getSnapshot().state).toMatchObject({ pending: { revision: 5, summary }, approval: null, running: null });
   });
   const record = conversationRecord(repository);
-  expect(new ConversationStore(directory).read(record.id, record.assignment)).toMatchObject({
+  expect((await new ConversationStateStore(directory).read(record.id))?.record).toMatchObject({
     pending: { revision: 5, summary }, approval: null, running: null,
   });
-  expect(generate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ prompt: getLabel('manager.goSummaryRequest', 'en') }));
+  expect(humanTurnText(generate.mock.calls[0]![0].prompt)).toBe(getLabel('manager.goSummaryRequest', 'en'));
   expect(registration).not.toHaveBeenCalled();
   expect((await new GoalStore(repository).list()).goals).toEqual([]);
   registration.mockImplementation(async ({ id, objective, outOfScope, acceptanceCriteria, constraints }) => {
@@ -121,10 +882,12 @@ it('regenerates with /make-goal on the same screen and registers the new proposa
   });
   app.stdin.write('\x1b[A');
   app.stdin.write('\r');
-  await waitFor(() => expect(new ConversationStore(directory).read(record.id, record.assignment)?.approval)
+  await waitFor(async () => expect((await new ConversationStateStore(directory).read(record.id))?.record?.approval)
     .toMatchObject({ revision: 5, state: 'registered' }));
-  const receipt = new ConversationStore(directory).read(record.id, record.assignment)!.approval!;
-  expect((await new GoalStore(repository).get(receipt.goalId)).objective).toBe(summary.objective);
+  const receipt = (await new ConversationStateStore(directory).read(record.id))?.record!.approval!;
+  const goals = (await new GoalStore(repository).list()).goals;
+  expect(goals).toHaveLength(1);
+  expect(await new GoalStore(repository).get(receipt.goalId)).toMatchObject(summary);
   expect(registration).toHaveBeenCalledOnce();
 });
 
@@ -146,7 +909,7 @@ it.each(['response', 'transfer'] as const)('approves the displayed proposal once
     expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' });
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.reading', 'en'));
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.incomplete', 'en'));
-    expect(app.lastFrame()).toContain(getLabel('manager.summaryInputHint', 'en'));
+    expect(app.lastFrame()!.replace(/\s/gu, '')).toContain(getLabel('manager.summaryInputHint', 'en').replace(/\s/gu, ''));
   });
   const submissions = vi.spyOn(client, 'submit');
   const refreshing = client.refresh();
@@ -154,7 +917,7 @@ it.each(['response', 'transfer'] as const)('approves the displayed proposal once
     await entered.promise;
     await waitFor(() => expect(service.snapshot).toHaveBeenCalled());
     expect.soft(app.lastFrame()).not.toContain(getLabel('manager.conversation.reading', 'en'));
-    expect.soft(app.lastFrame()).toContain(getLabel('manager.summaryInputHint', 'en'));
+    expect.soft(app.lastFrame()!.replace(/\s/gu, '')).toContain(getLabel('manager.summaryInputHint', 'en').replace(/\s/gu, ''));
     app.stdin.write('\x1b[A');
     app.stdin.write('\r');
     await waitFor(() => expect(submissions).toHaveBeenCalledExactlyOnceWith({ kind: 'approve_summary', revision: 4 }, undefined));
@@ -163,7 +926,7 @@ it.each(['response', 'transfer'] as const)('approves the displayed proposal once
     if (phase === 'response') released.release();
     expect(await submissions.mock.results[0]!.value).toMatchObject({ kind: 'accepted' });
     const record = conversationRecord(repository);
-    await waitFor(() => expect(new ConversationStore(directory).read(record.id, record.assignment)?.approval)
+    await waitFor(async () => expect((await new ConversationStateStore(directory).read(record.id))?.record?.approval)
       .toMatchObject({ revision: 4, state: 'registered' }));
     expect(registration).toHaveBeenCalledOnce();
   } finally { released.release(); await refreshing.catch(() => {}); app.unmount(); }
@@ -195,7 +958,7 @@ it('does not send approval before the initial transfer ends and enables it on th
     expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' });
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.reading', 'en'));
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.incomplete', 'en'));
-    expect(app.lastFrame()).toContain(getLabel('manager.summaryInputHint', 'en'));
+    expect(app.lastFrame()!.replace(/\s/gu, '')).toContain(getLabel('manager.summaryInputHint', 'en').replace(/\s/gu, ''));
   });
     app.stdin.write('\x1b[A');
     app.stdin.write('\r');
@@ -213,7 +976,7 @@ it.each(['read failure', 'disconnect'] as const)('blocks approval after a backgr
     expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' });
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.reading', 'en'));
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.incomplete', 'en'));
-    expect(app.lastFrame()).toContain(getLabel('manager.summaryInputHint', 'en'));
+    expect(app.lastFrame()!.replace(/\s/gu, '')).toContain(getLabel('manager.summaryInputHint', 'en').replace(/\s/gu, ''));
   });
   const submissions = vi.spyOn(client, 'submit');
   const entered = gate(); const released = gate();
@@ -252,7 +1015,7 @@ it.each(['read failure', 'disconnect'] as const)('blocks approval after a backgr
     expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' });
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.reading', 'en'));
     expect(app.lastFrame()).not.toContain(getLabel('manager.conversation.incomplete', 'en'));
-    expect(app.lastFrame()).toContain(getLabel('manager.summaryInputHint', 'en'));
+    expect(app.lastFrame()!.replace(/\s/gu, '')).toContain(getLabel('manager.summaryInputHint', 'en').replace(/\s/gu, ''));
   });
     app.stdin.write('\x1b[A');
     app.stdin.write('\r');
@@ -312,8 +1075,7 @@ it.each([
     await other.read.items[Symbol.asyncIterator]().return?.();
     await service.submit({ attachmentId: other.attachmentId, requestId: randomUUID(), speaker: selected.speaker,
       command: { kind: 'message', text: 'Produce the next proposal' } });
-    const store = new ConversationStore(directory);
-    await waitFor(() => expect(store.read(selected.conversationId, selected.assignment)).toMatchObject({ pending, running: null }));
+    await waitFor(async () => expect((await fixture.store.read(selected.conversationId))?.record).toMatchObject({ pending, running: null }));
     expect(client.getSnapshot().state?.pending?.revision).toBe(4);
     vi.spyOn(service, 'snapshot').mockImplementation(async (id) => {
       const read = await snapshot(id); const wait = gate(); reads.push({ read, release: wait.release });
@@ -332,7 +1094,7 @@ it.each([
     expect(stale).toMatchObject({ kind: 'error', code: 'stale_summary' });
     refreshed ??= client.refresh();
     await waitFor(() => expect(reads).toHaveLength(1));
-    expect(store.read(selected.conversationId, selected.assignment)).toMatchObject({ pending, approval: null, running: null });
+    expect((await fixture.store.read(selected.conversationId))?.record).toMatchObject({ pending, approval: null, running: null });
     expect(registration).not.toHaveBeenCalled();
     reads[0]!.release();
     await refreshed;
@@ -346,7 +1108,7 @@ it.each([
     expect(transfer.indexOf('transfer_start')).toBeLessThan(transfer.indexOf('transfer_end'));
     expect(transfer).not.toContain('cancel');
     expect(submissions.mock.calls.map(([command]) => command)).toEqual([{ kind, revision: 4 }]);
-    expect(store.read(selected.conversationId, selected.assignment)?.approval).toBeNull();
+    expect((await fixture.store.read(selected.conversationId))?.record?.approval).toBeNull();
     expect(registration).not.toHaveBeenCalled();
     expect((await new GoalStore(repository).list()).goals).toEqual([]);
     if (kind === 'approve_summary') { app.stdin.write('\x1b[A'); app.stdin.write('\r'); }
@@ -354,14 +1116,14 @@ it.each([
     await waitFor(() => expect(submissions).toHaveBeenCalledTimes(2));
     expect(submissions.mock.calls[1]![0]).toEqual({ kind, revision: 5 });
     expect(await submissions.mock.results[1]!.value).toMatchObject({ kind: 'accepted' });
-    await waitFor(() => expect(store.read(selected.conversationId, selected.assignment)).toMatchObject({ pending: null, running: null }));
+    await waitFor(async () => expect((await fixture.store.read(selected.conversationId))?.record).toMatchObject({ pending: null, running: null }));
     if (kind === 'approve_summary') {
-      const receipt = store.read(selected.conversationId, selected.assignment)!.approval!;
+      const receipt = (await fixture.store.read(selected.conversationId))!.record.approval!;
       expect(receipt).toMatchObject({ revision: 5, state: 'registered' });
       expect((await new GoalStore(repository).get(receipt.goalId)).objective).toBe(pending.summary.objective);
       expect(registration).toHaveBeenCalledOnce();
     } else {
-      expect(store.read(selected.conversationId, selected.assignment)?.approval).toBeNull();
+      expect((await fixture.store.read(selected.conversationId))?.record?.approval).toBeNull();
       expect((await new GoalStore(repository).list()).goals).toEqual([]);
       expect(registration).not.toHaveBeenCalled();
     }
@@ -372,11 +1134,23 @@ it.each([
   }
 });
 async function displayedSelection(key: string, kind: 'answer' | 'goal') {
+  const stopPolling = captureAndStopPolling();
   const component = vi.spyOn(selectionDialog, 'ManagerSelectionDialog');
   const app = render(createElement(ManagerView, { cwd: repository, lang: 'en', client, assignment,
     initialDiagnostics: [], onExit() {} }));
-  app.stdin.write(key);
-  await waitFor(() => expect(component.mock.calls.some(([props]) => props.selection.kind === kind)).toBe(true));
+  await stopPolling();
+  let readCompleted = false;
+  const unsubscribe = client.subscribe(() => {
+    if (client.getSnapshot().readStatus === 'complete') readCompleted = true;
+  });
+  try {
+    app.stdin.write(key);
+    await waitFor(() => expect(component.mock.calls.some(([props]) => props.selection.kind === kind)).toBe(true));
+    await waitFor(() => expect(readCompleted).toBe(true));
+  } finally {
+    unsubscribe();
+    await stopPolling();
+  }
   return { selection: [...component.mock.calls].reverse().find(([props]) => props.selection.kind === kind)![0].selection,
     frame: () => app.lastFrame() };
 }
@@ -412,7 +1186,7 @@ it('retains the corrupt-record diagnostic and incomplete status until a repaired
   await client.refresh(); await complete();
   expect(client.getSnapshot().items.filter((item) => item.kind === 'goal')).toEqual([
     { kind: 'goal', goal: { id: goal.id, objective: goal.objective, status: goal.status,
-      executionStatus: goal.executionStatus, repositoryDirectory: repository } },
+      executionStatus: goal.executionStatus, awaitingHumanMerge: false, repositoryDirectory: repository } },
   ]);
   expect(client.getSnapshot().items.some((item) => item.kind === 'display_event' && item.event.message.includes(file))).toBe(false);
 });
@@ -420,28 +1194,30 @@ it('retains the corrupt-record diagnostic and incomplete status until a repaired
 it.each([7, 9])('restores every pending constraint for %i large entries through the production receiver', async (count) => {
   const record = conversationRecord(repository);
   record.pending!.summary.constraints = Array.from({ length: count }, (_, index) => String(index).padEnd(128 * 1024, 'a'));
-  new ConversationStore(directory).write(record);
+  writeLegacyConversation(directory, record);
   await client.connect(); await complete();
   expect(client.getSnapshot().state).toMatchObject({ conversationId: record.id, revision: 4, pending: record.pending });
-  const component = vi.spyOn(summaryDialog, 'ManagerSummaryDialog');
+  const component = vi.mocked(transcriptView.TranscriptView);
   render(createElement(ManagerView, { cwd: repository, lang: 'en', client, assignment, initialDiagnostics: [], onExit() {} }));
-  await waitFor(() => expect(component).toHaveBeenCalled());
-  expect(component.mock.calls.at(-1)![0].pending).toEqual(record.pending);
+  await waitFor(() => {
+    const entries = component.mock.calls.at(-1)![0].entries.filter((entry) => entry.content.includes(record.pending!.summary.objective));
+    expect(entries).toHaveLength(1);
+    for (const value of record.pending!.summary.constraints) expect(entries[0]!.content).toContain(value);
+  });
+  expect((await new ConversationStateStore(directory).read(record.id))?.record?.pending).toEqual(record.pending);
 });
 
-it.each([7, 9])('restores the exact IDs, order and objectives of %i large goals without list reads', async (count) => {
+it.each([7, 9])('restores the exact IDs, order and objectives of %i large goals through the production receiver', async (count) => {
   const goals = Array.from({ length: count }, (_, index) => ({ ...goalRecord(),
     id: String(index + 1).padStart(8, '0') + '-1111-4111-8111-111111111111', objective: String(index).padEnd(128 * 1024, 'a') }));
   for (const goal of [...goals].reverse()) saveGoal(goal);
-  const list = vi.spyOn(GoalStore.prototype, 'list').mockRejectedValue(new Error('Array reads forbidden'));
   await client.connect(); await complete();
   expect(client.getSnapshot().items.flatMap((item) => item.kind === 'goal' ? [item.goal] : []))
-    .toEqual(goals.map(({ id, objective, status, executionStatus }) => ({ id, objective, status, executionStatus, repositoryDirectory: repository })));
-  expect(list).not.toHaveBeenCalled();
+    .toEqual(goals.map(({ id, objective, status, executionStatus }) => ({ id, objective, status, executionStatus, awaitingHumanMerge: false, repositoryDirectory: repository })));
   const { selection } = await displayedSelection('\x07', 'goal');
   if (selection.kind !== 'goal') throw new Error('Expected goal selection');
   expect(selection.candidates).toEqual(goals.map(({ id, objective, status, executionStatus }) => ({
-    id, objective, status, executionStatus, repositoryDirectory: repository,
+    id, objective, status, executionStatus, awaitingHumanMerge: false, repositoryDirectory: repository,
   })));
 });
 
@@ -460,20 +1236,9 @@ it.each([7, 9])('restores every option created by the real question operation fo
   expect(selection.candidates).toEqual([{ goalId: goal.id, repositoryDirectory: repository, objective: goal.objective, question: saved }]);
 });
 
-it.each([7, 9])('restores the full notice projection for a body containing %i large blocks', async (count) => {
-  const body = Array.from({ length: count }, (_, index) => String(index).padEnd(128 * 1024, 'a')).join('\n');
-  const goal = { ...goalRecord(), notifications: [{ id: '650e8400-e29b-41d4-a716-446655440001', kind: 'custom' as const,
-    body, recordedAt: '2026-10-24T00:00:00.000Z' }] };
-  saveGoal(goal); await client.connect(); await complete();
-  const notices = client.getSnapshot().items.flatMap((item) => item.kind === 'notice' ? [item.notice] : []);
-  expect(notices).toHaveLength(1);
-  expect(notices[0]).toMatchObject({ id: goal.notifications[0]!.id, repositoryDirectory: repository, goalId: goal.id, objective: goal.objective });
-  expect(notices[0]!.message).toContain(body);
-});
-
 it('removes the same standalone approval after withdrawal and refresh on the same client', async () => {
-  const inquiry = await saveManagerToolPermissionInquiry({ configDirectory: directory, owner: { kind: 'repository', repositoryDirectory: repository },
-    request: { toolName: 'Bash', toolInput: { command: 'git status' }, cwd: repository }, reason: 'Please confirm the operation' });
+  const connections = observeIpcConnections();
+  const inquiry = await new StandaloneInquiryStore(directory, { kind: 'repository', repositoryDirectory: repository }).create({ body: 'Please confirm the operation' });
   await client.connect(); await complete();
   const inquiries = () => client.getSnapshot().items.flatMap((item) => item.kind === 'inquiry' ? [item.inquiry] : []);
   expect(inquiries()).toEqual([{ target: { goalId: null, owner: { kind: 'repository', repositoryDirectory: repository } }, question: inquiry }]);
@@ -481,9 +1246,10 @@ it('removes the same standalone approval after withdrawal and refresh on the sam
   if (selection.kind !== 'answer') throw new Error('Expected inquiry selection');
   expect(selection.candidates).toEqual([{ goalId: null, owner: { kind: 'repository', repositoryDirectory: repository }, question: inquiry }]);
   await waitFor(() => expect(frame()).toContain(inquiry.body));
+  await vi.waitFor(() => expect(connections[0]!.snapshots.at(-1)!.complete).toBe(true), { timeout: 10_000 });
   await new StandaloneInquiryStore(directory, assignment).withdraw(inquiry.id);
-  await client.refresh();
-  await waitFor(() => expect(inquiries()).toEqual([]));
+  await refreshSnapshot(client, connections[0]!);
+  expect(inquiries()).toEqual([]);
   await waitFor(() => expect(frame()).not.toContain(inquiry.body));
 });
 
@@ -494,7 +1260,7 @@ it('forwards attachment overrides into the daemon runtime and delivers the compl
   expect(result.kind).toBe('accepted');
   await waitFor(() => expect(output).toHaveBeenCalledWith(expect.objectContaining({ kind: 'result', result: { kind: 'reply', message: 'finished' } })));
   expect(doubles.resolve).toHaveBeenCalledWith(assignment, expect.any(AbortSignal), { provider: 'mock', model: 'chosen-model' });
-  expect(execute).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'continue' }));
+  expect(execute.mock.calls.map(([input]) => humanTurnText(input.prompt))).toContain('continue');
   expect(client.getSnapshot().state).toMatchObject({ running: null, revision: 5 });
 });
 
@@ -505,5 +1271,488 @@ it('uses the explicit provider when opening even if the default provider plan is
   });
   await client.connect(); await complete();
   expect(client.getSnapshot()).toMatchObject({ connection: 'connected', state: { conversationId: conversationRecord(repository).id } });
-  expect(doubles.plan).toHaveBeenCalledExactlyOnceWith(repository, { provider: 'mock', model: 'chosen-model' });
+  expect(doubles.plan).not.toHaveBeenCalled();
+});
+
+interface ReceivedSnapshot {
+  transferId: string;
+  items: SnapshotItem[];
+  complete: boolean;
+}
+
+function observeIpcConnections() {
+  const connections: Array<{ socket: net.Socket; bytes: number; snapshots: ReceivedSnapshot[]; failures: number }> = [];
+  const connect = net.createConnection;
+  vi.spyOn(net, 'createConnection').mockImplementation((path, listener) => {
+    const socket = connect(path, listener);
+    const observation = { socket, bytes: 0, snapshots: [] as ReceivedSnapshot[], failures: 0 };
+    connections.push(observation);
+    const decoder = new frames.ConversationFrameDecoder();
+    const fragments = new Map<string, Buffer[]>();
+    socket.on('data', (chunk: Buffer) => {
+      observation.bytes += chunk.length;
+      for (const raw of decoder.decode(chunk)) {
+        const envelope = raw as { type: string; output?: { kind: string; transferId: string; purpose?: string;
+          itemIndex: number; finalFragment: boolean; data: string } };
+        const output = envelope.output;
+        if (envelope.type !== 'event' || output === undefined) continue;
+        if (output.kind === 'transfer_start' && output.purpose === 'snapshot') {
+          observation.snapshots.push({ transferId: output.transferId, items: [], complete: false });
+        }
+        const snapshot = observation.snapshots.find((read) => read.transferId === output.transferId);
+        if (snapshot === undefined) continue;
+        if (output.kind === 'transfer_data') {
+          const key = JSON.stringify([output.transferId, output.itemIndex]);
+          const parts = fragments.get(key) ?? [];
+          parts.push(Buffer.from(output.data, 'base64'));
+          if (output.finalFragment) {
+            snapshot.items.push(JSON.parse(Buffer.concat(parts).toString('utf8')) as SnapshotItem);
+            fragments.delete(key);
+          } else fragments.set(key, parts);
+        } else if (output.kind === 'transfer_end') snapshot.complete = true;
+        else if (output.kind === 'transfer_error') observation.failures++;
+      }
+    });
+    return socket;
+  });
+  return connections;
+}
+
+type IpcObservation = ReturnType<typeof observeIpcConnections>[number];
+
+async function refreshSnapshot(value: ConversationIpcClient, observation: IpcObservation) {
+  const previous = observation.snapshots.length;
+  await value.refresh();
+  await vi.waitFor(() => {
+    expect(observation.snapshots).toHaveLength(previous + 1);
+    expect(observation.snapshots.at(-1)!.complete).toBe(true);
+  }, { timeout: 10_000 });
+  expect(value.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete', error: null });
+  return observation.snapshots.at(-1)!;
+}
+
+function seedSnapshotGoals(count: number, recordsPerGoal: number, noticesPerGoal: number): Goal[] {
+  const recordedAt = '2000-01-01T00:00:00.000Z';
+  const goals: Goal[] = Array.from({ length: count }, (_, goalIndex) => ({
+    ...goalRecord(), id: `${String(goalIndex + 1).padStart(8, '0')}-1111-4111-8111-111111111111`,
+    objective: `Snapshot goal ${goalIndex + 1}`,
+    questions: [createInquiry({ body: `Snapshot question ${goalIndex + 1}`, options: ['CSV', 'JSON'] })],
+    workLog: Array.from({ length: recordsPerGoal }, (_, index) => ({ id: randomUUID(), recordedAt,
+      summary: `Historical work ${goalIndex}/${index} `.padEnd(1024, 'w') })),
+    notifications: Array.from({ length: noticesPerGoal }, (_, index) => ({ id: randomUUID(), recordedAt,
+      kind: 'custom', body: `Historical notice ${goalIndex}/${index} `.padEnd(1024, 'n') })),
+  }));
+  for (const goal of goals) saveGoal(goal);
+  return goals;
+}
+
+function displayedGoals(value: ConversationIpcClient) {
+  return value.getSnapshot().items.flatMap((item) => item.kind === 'goal' ? [item.goal] : []);
+}
+
+function displayedInquiries(value: ConversationIpcClient) {
+  return value.getSnapshot().items.flatMap((item) => item.kind === 'inquiry' ? [item.inquiry] : []);
+}
+
+async function snapshotView() {
+  const stopPolling = captureAndStopPolling();
+  const app = render(createElement(ManagerView, { cwd: repository, lang: 'en', client, assignment,
+    initialDiagnostics: [], onExit() {} }));
+  await stopPolling();
+  vi.spyOn(app.stdout, 'columns', 'get').mockReturnValue(80);
+  app.stdout.emit('resize');
+  await stopPolling();
+  // バイト計測と差分の観測には明示 refresh だけを使う。
+  return app;
+}
+
+async function openSnapshotMenu(app: ReturnType<typeof render>, kind: 'answer' | 'goal', observation: IpcObservation) {
+  const previous = observation.snapshots.length;
+  app.stdin.write(kind === 'answer' ? '\x12' : '\x07');
+  await vi.waitFor(() => {
+    expect(app.lastFrame()).toContain(getLabel(`manager.selectionTitles.${kind}`, 'en'));
+    expect(observation.snapshots).toHaveLength(previous + 1);
+    expect(observation.snapshots.at(-1)!.complete).toBe(true);
+  });
+}
+
+it('[SCN-SNAP-SIZE-P1] receives at most 4096 IPC bytes for an unchanged refresh and retains the displayed goals and inquiries', async () => {
+  seedSnapshotGoals(30, 100, 10);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const observation = connections[0]!;
+  const goals = displayedGoals(client);
+  const inquiries = displayedInquiries(client);
+  expect(goals).toHaveLength(30);
+  expect(inquiries).toHaveLength(30);
+  const app = await snapshotView();
+  const headings = [getLabel('manager.assignmentHeading', 'en', { name: 'repository' }),
+    getLabel('manager.counts', 'en', { goals: String(goals.length), awaiting: '0', questions: String(inquiries.length) })];
+  await vi.waitFor(() => expect(app.lastFrame()).toContain(headings.join(' | ')));
+  const bytes = observation.bytes;
+
+  const received = await refreshSnapshot(client, observation);
+
+  console.info(`Unchanged snapshot IPC bytes: ${observation.bytes - bytes}`);
+  expect.soft(observation.bytes - bytes).toBeGreaterThan(0);
+  expect.soft(observation.bytes - bytes).toBeLessThanOrEqual(4096);
+  expect.soft(received.items).toHaveLength(0);
+  expect.soft(displayedGoals(client)).toEqual(goals);
+  expect.soft(displayedInquiries(client)).toEqual(inquiries);
+  await vi.waitFor(() => expect(app.lastFrame()).toContain(headings.join(' | ')));
+});
+
+it('[SCN-SNAP-SIZE-P2] initially receives all thirty goals and pending inquiries without historical events or notice items', async () => {
+  const goals = seedSnapshotGoals(30, 100, 10);
+  const connections = observeIpcConnections();
+
+  await client.connect(); await complete();
+
+  const received = connections[0]!.snapshots[0]!;
+  expect(received.complete).toBe(true);
+  expect(received.items.flatMap((item) => item.kind === 'goal' ? [item.goal.id] : [])).toEqual(goals.map((goal) => goal.id));
+  expect(received.items.flatMap((item) => item.kind === 'inquiry' ? [item.inquiry.question.id] : []))
+    .toEqual(goals.map((goal) => goal.questions![0]!.id));
+  expect(received.items.map((item) => item.kind).filter((kind) => !['state', 'assignment', 'goal', 'inquiry'].includes(kind))).toHaveLength(0);
+  expect(displayedGoals(client)).toHaveLength(30);
+  expect(displayedInquiries(client)).toHaveLength(30);
+});
+
+it('[SCN-SNAP-DELTA-P1] hides appended work logs while displaying the changed goal, notification and manager reply', async () => {
+  const [goal] = seedSnapshotGoals(2, 1, 1);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const record = { id: randomUUID(), recordedAt: new Date().toISOString(), summary: 'New work after attachment' };
+  saveGoal({ ...goal!, workLog: [...goal!.workLog, record] });
+  const workOnly = await refreshSnapshot(client, connections[0]!);
+  expect(workOnly.items).toEqual([]);
+  expect(app.lastFrame()).not.toContain(record.summary);
+  const notification = { id: randomUUID(), recordedAt: record.recordedAt, kind: 'progress' as const, body: 'Visible progress after attachment' };
+  saveGoal({ ...goal!, executionStatus: 'paused', workLog: [...goal!.workLog, record],
+    notifications: [...goal!.notifications!, notification] });
+
+  const received = await refreshSnapshot(client, connections[0]!);
+
+  expect.soft(received.items.filter((item) => item.kind !== 'state')).toEqual([
+    { kind: 'goal', goal: { id: goal!.id, objective: goal!.objective, status: goal!.status,
+      executionStatus: 'paused', awaitingHumanMerge: false, repositoryDirectory: repository } },
+    { kind: 'display_event', event: { id: JSON.stringify([repository, goal!.id, 'notification', notification.id]),
+      message: formatGoalNotification(goal!, notification, 'en', 'repository', 'tui') } },
+  ]);
+  await vi.waitFor(() => expect(app.lastFrame()!.split(notification.body)).toHaveLength(2));
+  expect(await client.submit({ kind: 'message', text: 'Reply after recording internal work' })).toMatchObject({ kind: 'accepted' });
+  await vi.waitFor(() => expect(app.lastFrame()).toContain('finished'));
+  await refreshSnapshot(client, connections[0]!);
+  await vi.waitFor(() => expect(app.lastFrame()!.split(notification.body)).toHaveLength(2));
+  for (const [props] of vi.mocked(transcriptView.TranscriptView).mock.calls) {
+    expect(props.entries.some((entry) => entry.content.includes(record.summary))).toBe(false);
+  }
+  expect((await new GoalStore(repository).get(goal!.id)).workLog).toEqual([...goal!.workLog, record]);
+  expect(displayedGoals(client)).toHaveLength(2);
+});
+
+it('[SCN-SNAP-DELTA-P2] updates a paused goal and removes its answered inquiry while preserving other rows on the same screen', async () => {
+  const [goal, other] = seedSnapshotGoals(2, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  await openSnapshotMenu(app, 'answer', connections[0]!);
+  await vi.waitFor(() => expect(app.lastFrame()).toContain('Snapshot goal 1'));
+  const unchangedGoal = displayedGoals(client).find((row) => row.id === other!.id);
+  const unchangedInquiry = displayedInquiries(client).find((row) => row.target.goalId === other!.id);
+  saveGoal({ ...goal!, executionStatus: 'paused', questions: [answerInquiry(goal!.questions![0]!, 'CSV')] });
+
+  await refreshSnapshot(client, connections[0]!);
+
+  expect(displayedGoals(client).find((row) => row.id === goal!.id)?.executionStatus).toBe('paused');
+  expect(displayedGoals(client).find((row) => row.id === other!.id)).toEqual(unchangedGoal);
+  expect(displayedInquiries(client)).toEqual([unchangedInquiry]);
+  await vi.waitFor(() => {
+    expect(app.lastFrame()).not.toContain('Snapshot goal 1');
+    expect(app.lastFrame()).toContain('Snapshot goal 2');
+    expect(app.lastFrame()).toContain(getLabel('manager.counts', 'en', { goals: '2', awaiting: '0', questions: '1' }));
+  });
+  app.stdin.write('\x1b[27u');
+  await vi.waitFor(() => expect(app.lastFrame()).not.toContain(getLabel('manager.selectionTitles.answer', 'en')));
+  app.stdin.write('\x07');
+  await vi.waitFor(() => expect(app.lastFrame()).toContain(`Snapshot goal 1 — ${getLabel('manager.goalStates.paused', 'en')}`));
+});
+
+it('[SCN-SNAP-RECONNECT-P1] reconnects the same client and screen with a complete latest list without replaying disconnected history', async () => {
+  const [goal] = seedSnapshotGoals(1, 1, 1);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const entered = gate(); const released = gate();
+  const open = service.open.bind(service);
+  vi.spyOn(service, 'open').mockImplementation(async (...args) => {
+    entered.release(); await released.promise; return open(...args);
+  });
+  const states: string[] = [];
+  const unsubscribe = client.subscribe(() => states.push(client.getSnapshot().connection));
+  connections[0]!.socket.destroy();
+  try {
+    await entered.promise;
+    const duringDisconnect = { id: randomUUID(), recordedAt: new Date(Date.now() - 1).toISOString(), summary: 'Work while disconnected' };
+    const disconnectedNotification = { id: randomUUID(), recordedAt: duringDisconnect.recordedAt,
+      kind: 'progress' as const, body: 'Progress while disconnected' };
+    const disconnectedGoal = { ...goal!, workLog: [...goal!.workLog, duringDisconnect],
+      notifications: [...goal!.notifications!, disconnectedNotification] };
+    saveGoal(disconnectedGoal);
+    const added = { ...goalRecord(), id: '650e8400-e29b-41d4-a716-446655440000', objective: 'Added while disconnected' };
+    saveGoal(added);
+    released.release();
+    await vi.waitFor(() => expect(client.getSnapshot()).toMatchObject({ connection: 'connected', readStatus: 'complete' }), { timeout: 2000 });
+    expect(states).toContain('disconnected');
+    expect(displayedGoals(client).map((row) => row.id)).toEqual([goal!.id, added.id]);
+    const received = connections[1]!.snapshots[0]!;
+    expect(received.items.flatMap((item) => item.kind === 'goal' ? [item.goal.id] : [])).toEqual([goal!.id, added.id]);
+    expect.soft(received.items.map((item) => item.kind).filter((kind) => !['state', 'assignment', 'goal', 'inquiry'].includes(kind))).toEqual([]);
+    await vi.waitFor(() => expect(app.lastFrame()).toContain(getLabel('manager.counts', 'en', { goals: '2', awaiting: '0', questions: '1' })));
+    expect(app.lastFrame()).not.toContain(duringDisconnect.summary);
+    expect(app.lastFrame()).not.toContain(disconnectedNotification.body);
+    const notification = { id: randomUUID(), recordedAt: new Date().toISOString(),
+      kind: 'progress' as const, body: 'Progress after reconnection' };
+    saveGoal({ ...disconnectedGoal, notifications: [...disconnectedGoal.notifications, notification] });
+    const refreshed = await refreshSnapshot(client, connections[1]!);
+    expect(refreshed.items.flatMap((item) => item.kind === 'display_event' ? [item.event] : [])).toEqual([
+      { id: JSON.stringify([repository, goal!.id, 'notification', notification.id]),
+        message: formatGoalNotification(goal!, notification, 'en', 'repository', 'tui') },
+    ]);
+    await vi.waitFor(() => expect(app.lastFrame()!.split(notification.body)).toHaveLength(2));
+    const unchanged = await refreshSnapshot(client, connections[1]!);
+    expect(unchanged.items).toEqual([]);
+    expect(app.lastFrame()!.split(notification.body)).toHaveLength(2);
+    expect(app.lastFrame()).not.toContain(disconnectedNotification.body);
+    app.stdin.write('\x07');
+    await vi.waitFor(() => expect(app.lastFrame()).toContain(added.objective));
+  } finally { released.release(); unsubscribe(); }
+});
+
+it('keeps events for identical goals in different workspace repositories across delta reads', async () => {
+  const secondRepository = join(directory, 'second-repository');
+  mkdirSync(secondRepository, { recursive: true });
+  assignment = { kind: 'workspace', workspaceId: randomUUID(), name: 'Workspace', repositoryDirectories: [repository, secondRepository] };
+  doubles.assignment.mockResolvedValue(assignment);
+  client.close();
+  client = new ConversationIpcClient(assignment, { provider: 'mock' });
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+
+  const record = { id: randomUUID(), recordedAt: new Date().toISOString(), summary: 'Shared work' };
+  const notification = { id: randomUUID(), kind: 'progress' as const, body: 'Shared notice', recordedAt: record.recordedAt };
+  const goal = { ...goalRecord(), workLog: [record], notifications: [notification] };
+  saveGoal(goal, repository); saveGoal(goal, secondRepository);
+  const received = await refreshSnapshot(client, connections[0]!);
+  const events = received.items.flatMap((item) => item.kind === 'display_event' ? [item.event] : []);
+  expect(received.complete).toBe(true);
+  expect(events.map((event) => event.id).sort()).toEqual([repository, secondRepository].flatMap((path) => [
+    JSON.stringify([path, goal.id, 'notification', notification.id]),
+  ]).sort());
+  expect(client.getSnapshot().items.filter((item) => item.kind === 'goal')).toHaveLength(2);
+  expect(client.getSnapshot().items.filter((item) => item.kind === 'display_event')).toHaveLength(2);
+
+  const unchanged = await refreshSnapshot(client, connections[0]!);
+  expect(unchanged.items).toEqual([]);
+  saveGoal({ ...goal, workLog: [], notifications: [] }, repository);
+  const changed = await refreshSnapshot(client, connections[0]!);
+  expect(changed.items).toContainEqual({ kind: 'remove', key: JSON.stringify(['display_event', JSON.stringify([repository, goal.id, 'notification', notification.id])]) });
+  expect(client.getSnapshot().readStatus).toBe('complete');
+  expect(client.getSnapshot().items.flatMap((item) => item.kind === 'display_event' ? [item.event.id] : []).sort())
+    .toEqual(events.map((event) => event.id).filter((id) => id !== JSON.stringify([repository, goal.id, 'notification', notification.id])).sort());
+});
+
+it('[SCN-SNAP-MULTI-N1] delivers the same new notification once to each attachment when the second client refreshes first', async () => {
+  const [goal] = seedSnapshotGoals(1, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const second = new ConversationIpcClient(assignment, { provider: 'mock' });
+  try {
+    await second.connect();
+    await vi.waitFor(() => expect(second.getSnapshot().readStatus).toBe('complete'));
+    const record = { id: randomUUID(), recordedAt: new Date().toISOString(), summary: 'Work for both attachments' };
+    const notification = { id: randomUUID(), recordedAt: record.recordedAt, kind: 'progress' as const, body: 'Progress for both attachments' };
+    saveGoal({ ...goal!, workLog: [record], notifications: [notification] });
+
+    const fromSecond = await refreshSnapshot(second, connections[1]!);
+    const fromFirst = await refreshSnapshot(client, connections[0]!);
+
+    const expected = [{ id: JSON.stringify([repository, goal!.id, 'notification', notification.id]),
+      message: formatGoalNotification(goal!, notification, 'en', 'repository', 'tui') }];
+    for (const received of [fromFirst, fromSecond]) {
+      expect(received.items.flatMap((item) => item.kind === 'display_event' ? [item.event] : [])).toEqual(expected);
+    }
+    for (const [value, observation] of [[client, connections[0]!], [second, connections[1]!]] as const) {
+      const unchanged = await refreshSnapshot(value, observation);
+      expect.soft(unchanged.items).toEqual([]);
+      expect(value.getSnapshot().items.flatMap((item) => item.kind === 'display_event' ? [item.event] : [])).toEqual(expected);
+    }
+  } finally { second.close(); }
+});
+
+it('[SCN-SNAP-UI-P1] preserves the width eighty headings and both menus and displays a new notification exactly once', async () => {
+  const goals = seedSnapshotGoals(2, 1, 1);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const app = await snapshotView();
+  const headings = [getLabel('manager.assignmentHeading', 'en', { name: 'repository' }),
+    getLabel('manager.counts', 'en', { goals: '2', awaiting: '0', questions: '2' })];
+  await vi.waitFor(() => expect(app.lastFrame()).toContain(headings.join(' | ')));
+  expect(app.lastFrame()).not.toMatch(/Historical (?:work|notice)/u);
+  await openSnapshotMenu(app, 'answer', connections[0]!);
+  await vi.waitFor(() => {
+    expect(app.lastFrame()).toContain(getLabel('manager.selectionTitles.answer', 'en'));
+    for (const goal of goals) expect(app.lastFrame()).toContain(goal.objective);
+  });
+  app.stdin.write('\x1b[27u');
+  await vi.waitFor(() => expect(app.lastFrame()).not.toContain(getLabel('manager.selectionTitles.answer', 'en')));
+  await openSnapshotMenu(app, 'goal', connections[0]!);
+  await vi.waitFor(() => {
+    expect(app.lastFrame()).toContain(getLabel('manager.selectionTitles.goal', 'en'));
+    for (const goal of goals) expect(app.lastFrame()).toContain(`${goal.objective} — ${getLabel('manager.goalStates.active', 'en')}`);
+  });
+  app.stdin.write('\x1b[27u');
+  await vi.waitFor(() => expect(app.lastFrame()).not.toContain(getLabel('manager.selectionTitles.goal', 'en')));
+  const notification = { id: randomUUID(), recordedAt: new Date().toISOString(), kind: 'custom' as const, body: 'New notification after attachment' };
+  saveGoal({ ...goals[0]!, notifications: [...goals[0]!.notifications!, notification] });
+
+  await refreshSnapshot(client, connections[0]!);
+
+  await vi.waitFor(() => expect(app.lastFrame()!.split(notification.body)).toHaveLength(2));
+  await refreshSnapshot(client, connections[0]!);
+  await vi.waitFor(() => expect(app.lastFrame()!.split(notification.body)).toHaveLength(2));
+  expect(app.lastFrame()).toContain(headings.join(' | '));
+  expect(app.lastFrame()).not.toMatch(/Historical (?:work|notice)/u);
+});
+
+it.each(['transfer_data', 'transfer_end'] as const)('releases the read and retries every uncommitted change after %s fails on the same attachment', async (failedKind) => {
+  const [goal] = seedSnapshotGoals(2, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const previousInquiries = displayedInquiries(client);
+  const record = { id: randomUUID(), recordedAt: new Date().toISOString(), summary: 'Work retained after failed transfer' };
+  const notification = { id: randomUUID(), recordedAt: record.recordedAt, kind: 'progress' as const, body: 'Progress retained after failed transfer' };
+  const updated = { ...goal!, executionStatus: 'paused' as const,
+    questions: [answerInquiry(goal!.questions![0]!, 'CSV')], workLog: [record], notifications: [notification] };
+  saveGoal(updated);
+  const released = vi.fn();
+  const snapshot = service.snapshot.bind(service);
+  vi.spyOn(service, 'snapshot').mockImplementation(async (id) => {
+    const read = await snapshot(id);
+    return { ...read, items: (async function* () {
+      try { yield* read.items; }
+      finally { released(); }
+    })() };
+  });
+  const write = frames.writeConversationFrame;
+  let failedTransfer: string | undefined;
+  vi.spyOn(frames, 'writeConversationFrame').mockImplementation(async (socket, value) => {
+    const envelope = value as { output?: { kind: string; transferId: string } };
+    if (failedTransfer === undefined && envelope.output?.kind === failedKind) {
+      failedTransfer = envelope.output.transferId;
+      throw new Error('Snapshot write failed');
+    }
+    return write(socket, value);
+  });
+
+  await client.refresh();
+  await vi.waitFor(() => expect(client.getSnapshot().readStatus).toBe('incomplete'));
+  expect(connections[0]!.failures).toBe(1);
+  expect(released).toHaveBeenCalledOnce();
+  expect(displayedInquiries(client)).toEqual(previousInquiries);
+  const received = await refreshSnapshot(client, connections[0]!);
+
+  expect(received.items).toContainEqual({ kind: 'goal', goal: { id: goal!.id, objective: goal!.objective, status: goal!.status,
+    executionStatus: 'paused', awaitingHumanMerge: false, repositoryDirectory: repository } });
+  expect(received.items).toContainEqual({ kind: 'display_event', event: { id: JSON.stringify([repository, goal!.id, 'notification', notification.id]),
+    message: formatGoalNotification(goal!, notification, 'en', 'repository', 'tui') } });
+  expect(displayedInquiries(client)).toEqual([previousInquiries[1]]);
+  expect(displayedGoals(client)).toHaveLength(2);
+  expect(released).toHaveBeenCalledTimes(2);
+});
+
+it('reuses unchanged goal files and reloads modified or deleted goals on the same attachment', async () => {
+  const [goal, other] = seedSnapshotGoals(2, 0, 0);
+  const connections = observeIpcConnections();
+  const reads = vi.spyOn(daemonFiles, 'readPrivateFile');
+  const goalReads = () => reads.mock.calls.map(([path]) => path).filter((path) => path.endsWith('/goal.json'));
+  await client.connect(); await complete();
+  expect(goalReads()).toHaveLength(2);
+  reads.mockClear();
+
+  await refreshSnapshot(client, connections[0]!);
+  expect.soft(goalReads()).toEqual([]);
+  reads.mockClear();
+  saveGoal({ ...goal!, objective: 'Changed objective after initial snapshot' });
+  await refreshSnapshot(client, connections[0]!);
+  expect.soft(goalReads()).toEqual([join(repository, '.takt', 'goals', goal!.id, 'goal.json')]);
+  expect(displayedGoals(client).find((row) => row.id === goal!.id)?.objective).toBe('Changed objective after initial snapshot');
+  rmSync(join(repository, '.takt', 'goals', other!.id), { recursive: true });
+  await refreshSnapshot(client, connections[0]!);
+  expect(displayedGoals(client).map((row) => row.id)).toEqual([goal!.id]);
+});
+
+it.each(['corruption', 'symlink'] as const)('reports %s after a successful read instead of hiding it behind cached goal data and recovers after repair', async (failure) => {
+  const [goal] = seedSnapshotGoals(1, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const path = join(repository, '.takt', 'goals', goal!.id, 'goal.json');
+  const saved = join(directory, 'saved-goal.json');
+  if (failure === 'corruption') writeFileSync(path, '{broken');
+  else {
+    renameSync(path, saved);
+    symlinkSync(saved, path);
+  }
+
+  await client.refresh();
+  await vi.waitFor(() => expect(client.getSnapshot().readStatus).toBe('incomplete'));
+
+  expect(client.getSnapshot().connection).toBe('connected');
+  expect(connections[0]!.failures).toBe(1);
+  expect(displayedGoals(client).map((row) => row.id)).toEqual([goal!.id]);
+  if (failure === 'symlink') rmSync(path);
+  saveGoal({ ...goal!, objective: 'Repaired goal file' });
+  await refreshSnapshot(client, connections[0]!);
+  expect(displayedGoals(client).map((row) => row.objective)).toEqual(['Repaired goal file']);
+});
+
+it('applies multiple updates and removals to a thirty-goal list while retaining unrelated entries and their order', async () => {
+  const goals = seedSnapshotGoals(30, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const previousGoals = displayedGoals(client);
+  const previousInquiries = displayedInquiries(client);
+  const changed = [goals[0]!, goals[14]!, goals[29]!];
+  const removed = [goals[1]!, goals[15]!];
+  for (const goal of changed) saveGoal({ ...goal, executionStatus: 'paused' });
+  for (const goal of removed) rmSync(join(repository, '.takt', 'goals', goal.id), { recursive: true });
+
+  const received = await refreshSnapshot(client, connections[0]!);
+
+  expect.soft(received.items.flatMap((item) => item.kind === 'goal' ? [item.goal.id] : [])).toEqual(changed.map((goal) => goal.id));
+  expect(displayedGoals(client)).toEqual(previousGoals.filter((row) => !removed.some((goal) => goal.id === row.id))
+    .map((row) => changed.some((goal) => goal.id === row.id) ? { ...row, executionStatus: 'paused' } : row));
+  expect(displayedInquiries(client)).toEqual(previousInquiries.filter((row) => !removed.some((goal) => goal.id === row.target.goalId)));
+});
+
+it('reprojects unchanged goal files when notification policy changes on the same attachment', async () => {
+  const [goal] = seedSnapshotGoals(1, 0, 0);
+  const connections = observeIpcConnections();
+  await client.connect(); await complete();
+  const observation = connections[0]!;
+  saveGoal({ ...goal!, notifications: [{ id: randomUUID(), kind: 'custom', body: 'Policy-controlled notice', recordedAt: new Date().toISOString() }] });
+  await refreshSnapshot(client, observation);
+  const events = () => client.getSnapshot().items.filter((item) => item.kind === 'display_event');
+  expect(events()).toHaveLength(1);
+  writeFileSync(join(repository, '.takt', 'config.yaml'), 'manager:\n  notifications:\n    custom: false\n');
+  invalidateResolvedConfigCache(repository);
+  const disabled = await refreshSnapshot(client, observation);
+  expect(disabled.items.filter((item) => item.kind === 'remove')).toHaveLength(1);
+  expect(events()).toEqual([]);
+  writeFileSync(join(repository, '.takt', 'config.yaml'), 'manager:\n  notifications:\n    custom: true\n');
+  invalidateResolvedConfigCache(repository);
+  await refreshSnapshot(client, observation);
+  expect(events()).toHaveLength(1);
+  expect(events()[0]).toMatchObject({ event: { message: expect.stringContaining('Policy-controlled notice') } });
 });

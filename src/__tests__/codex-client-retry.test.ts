@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { interpolateMcpEnv, McpSectionSchema } from '../infra/config/runtime-provider/mcp-schema.js';
+import { resolveMcpAssignment } from '../infra/config/runtime-provider/mcp-assignment.js';
+import { createCodexMcpAdapter } from '../infra/providers/mcp/codex.js';
+import { CODEX_SPAWN_OPTIONS, type CodexSpawnEnvironment } from '../infra/codex/types.js';
 
 type MockEvent = Record<string, unknown>;
 type RunPlan =
@@ -167,6 +171,40 @@ describe('CodexClient retry', () => {
     tempRoots.clear();
   });
 
+  it.each([undefined, false, true].flatMap((aiReviewPermissions) =>
+    (['takt', 'codex'] as const).map((permissionControl) => ({ aiReviewPermissions, permissionControl })),
+  ))('configures AI permission review only when requested (auto=$aiReviewPermissions, control=$permissionControl)', async ({ aiReviewPermissions, permissionControl }) => {
+    runPlans = Array.from({ length: 2 }, () => ({ type: 'events' as const, events: [
+      { type: 'thread.started', thread_id: 'thread-permissions' },
+      { type: 'turn.completed' },
+    ] }));
+    const client = new CodexClient();
+    for (const sessionId of [undefined, 'thread-permissions']) {
+      const result = await client.call('manager', 'continue', {
+        cwd: projectDirectory, permissionMode: 'full', aiReviewPermissions, sessionId,
+        networkAccess: false, permissionControl,
+      });
+      expect(result.status).toBe('done');
+    }
+    for (const options of [startThreadCalls[0], resumeThreadCalls[0]?.options]) {
+      expect(options?.approvalPolicy).toBe(aiReviewPermissions ? 'on-request' : 'never');
+      if (aiReviewPermissions) {
+        expect(options).toMatchObject({ sandboxMode: 'workspace-write', networkAccessEnabled: true });
+      } else if (permissionControl === 'codex') {
+        expect(options).not.toHaveProperty('sandboxMode');
+        expect(options).not.toHaveProperty('networkAccessEnabled');
+      } else {
+        expect(options).toMatchObject({ sandboxMode: 'danger-full-access', networkAccessEnabled: false });
+      }
+    }
+    for (const options of codexConstructorCalls) {
+      if (aiReviewPermissions) expect(options?.config).toHaveProperty('approvals_reviewer', 'auto_review');
+      else expect(options?.config).not.toHaveProperty('approvals_reviewer');
+      expect((options?.env as CodexSpawnEnvironment)[CODEX_SPAWN_OPTIONS]?.execArgs)
+        .toEqual(aiReviewPermissions || permissionControl === 'takt' ? ['--ignore-rules'] : []);
+    }
+  });
+
   it.each(['turn.failed', 'error', 'exception'] as const)('classifies a confirmed resume rejection from %s through both provider entrances', async (source) => {
     const sessionId = '00000000-0000-4000-8000-000000000099';
     const diagnostic = `Error: thread/resume: thread/resume failed: no rollout found for thread id ${sessionId} (code -32600)`;
@@ -305,7 +343,7 @@ describe('CodexClient retry', () => {
       ] }];
       const onStream = vi.fn();
       const pending = new CodexClient().call('coder', 'original prompt', {
-        cwd: '/tmp', model: 'gpt-5.4', permissionMode: 'readonly',
+        cwd: '/tmp', model: 'gpt-5.4', permissionMode: 'readonly', networkAccess: true,
         outputSchema: { type: 'object' }, onStream,
       });
       await vi.advanceTimersByTimeAsync(999);
@@ -321,7 +359,16 @@ describe('CodexClient retry', () => {
       expect(runPlanIndex).toBe(3);
       expect(runStreamedInputs).toEqual(['original prompt', 'original prompt', 'original prompt']);
       for (const options of [...startThreadCalls, ...resumeThreadCalls.map((call) => call.options)]) {
-        expect(options).toMatchObject({ model: 'gpt-5.4', sandboxMode: 'read-only' });
+        expect(options).toMatchObject({ model: 'gpt-5.4' });
+        expect(options).not.toHaveProperty('sandboxMode');
+        expect(options).not.toHaveProperty('networkAccessEnabled');
+      }
+      expect(codexConstructorCalls).toHaveLength(3);
+      for (const options of codexConstructorCalls) {
+        expect(options?.config).toMatchObject({
+          default_permissions: 'takt-readonly-network',
+          permissions: { 'takt-readonly-network': { extends: ':read-only', network: { enabled: true } } },
+        });
       }
       const terminal = onStream.mock.calls.filter(([event]) => event.type === 'result');
       expect(terminal).toHaveLength(1);
@@ -858,6 +905,87 @@ describe('CodexClient retry', () => {
         },
       },
     });
+  });
+
+  it('passes runtime header secrets to the Codex process while excluding their names from its tool shell', async () => {
+    const shellPath = '/opt/takt/bin:/usr/bin:/bin';
+    const secret = 'synthetic-access-fragment.signature-fragment';
+    vi.stubEnv('PATH', shellPath);
+    vi.stubEnv('MCP_HEADER_ACCESS', secret);
+    vi.stubEnv('MCP_HEADER_KEY', 'synthetic-key-fragment');
+    const section = McpSectionSchema.parse({
+      servers: { datadog: {
+        type: 'http', url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer ${env:MCP_HEADER_ACCESS}', 'X-Key': '${env:MCP_HEADER_KEY}' },
+      } },
+      defaults: { servers: ['datadog'] },
+    });
+    const servers = resolveMcpAssignment(section, {
+      persona: 'coder', tags: [], stepQualifiedName: 'default/implement',
+      isWorkflowCallNode: false, isInternalAgent: false,
+    });
+    const preparedMcp = await createCodexMcpAdapter().prepare(servers, { cwd: '/tmp' });
+    runPlans = [{
+      type: 'events', events: [
+        { type: 'thread.started', thread_id: 'thread-1' },
+        { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+      ],
+    }];
+
+    try {
+      const result = await new CodexClient().call('coder', 'prompt', { cwd: '/tmp', preparedMcp });
+      expect(result.status).toBe('done');
+      expect(codexConstructorCalls[0]).toMatchObject({
+        env: { PATH: shellPath, MCP_HEADER_ACCESS: secret, MCP_HEADER_KEY: 'synthetic-key-fragment' },
+        config: {
+          mcp_servers: { datadog: {
+            bearer_token_env_var: 'MCP_HEADER_ACCESS', env_http_headers: { 'X-Key': 'MCP_HEADER_KEY' },
+          } },
+          shell_environment_policy: {
+            set: { PATH: shellPath },
+            filters: { MCP_HEADER_ACCESS: 'exclude', MCP_HEADER_KEY: 'exclude' },
+          },
+        },
+      });
+      const config = JSON.stringify(codexConstructorCalls[0]?.config);
+      for (const fragment of ['synthetic-access-fragment', 'signature-fragment', 'synthetic-key-fragment']) {
+        expect(config).not.toContain(fragment);
+      }
+    } finally {
+      await preparedMcp.dispose();
+    }
+  });
+
+  it('does not copy PATH into shell settings when PATH itself is a provider header secret', async () => {
+    const shellPath = '/opt/takt/bin:/usr/bin:/bin';
+    vi.stubEnv('PATH', shellPath);
+    const server = interpolateMcpEnv({
+      type: 'http', url: 'https://example.com/mcp', headers: { 'X-Path': '${env:PATH}' },
+    });
+    const preparedMcp = await createCodexMcpAdapter().prepare({
+      enabled: true, servers: { datadog: server }, serverNames: ['datadog'], identity: 'datadog:http',
+    }, { cwd: '/tmp' });
+    runPlans = [{
+      type: 'events', events: [
+        { type: 'thread.started', thread_id: 'thread-1' },
+        { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+      ],
+    }];
+
+    try {
+      const result = await new CodexClient().call('coder', 'prompt', { cwd: '/tmp', preparedMcp });
+      expect(result.status).toBe('done');
+      expect(codexConstructorCalls[0]).toMatchObject({
+        env: { PATH: shellPath },
+        config: { shell_environment_policy: { filters: { PATH: 'exclude' } } },
+      });
+      const config = codexConstructorCalls[0]?.config as Record<string, unknown>;
+      const policy = config.shell_environment_policy as { set?: Record<string, string> };
+      expect(policy.set?.PATH).toBeUndefined();
+      expect(JSON.stringify(config)).not.toContain('/opt/takt/bin');
+    } finally {
+      await preparedMcp.dispose();
+    }
   });
 
   it('例外経路の at capacity を 1 秒、2 秒の指数バックオフで retry する', async () => {

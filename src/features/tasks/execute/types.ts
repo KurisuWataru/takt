@@ -8,6 +8,7 @@ import type {
   AutoRoutingStrategy,
   PersonaProviderEntry,
   ProviderRoutingConfig,
+  WorkflowSystemCommandsConfig,
 } from '../../../core/models/config-types.js';
 import type { ProviderPermissionProfiles } from '../../../core/models/provider-profiles.js';
 import type { StepProviderOptions } from '../../../core/models/workflow-types.js';
@@ -17,6 +18,7 @@ import type {
   AskUserQuestionHandler,
   SelectorProviderInfo,
   StepProviderInfo,
+  WorkflowAbortKind,
   WorkflowCallResolver,
   WorkflowTraceTaskMetadata,
 } from '../../../core/workflow/types.js';
@@ -199,6 +201,7 @@ export interface WorkflowExecutionResult {
   setupFailed?: boolean;
   interrupted?: boolean;
   success: boolean;
+  abortKind?: WorkflowAbortKind;
   /** Whether the root or a started child workflow defines an explicit Caccia effect. */
   workflowHasCaccia?: boolean;
   reason?: string;
@@ -224,6 +227,8 @@ export interface InteractiveMetadata {
 
 /** Options for workflow execution */
 export interface WorkflowExecutionOptions extends PrMergeOptions {
+  /** System command permission resolved for this run, including the configuration source. */
+  workflowSystemCommandsPolicy?: WorkflowSystemCommandsConfig;
   /** Header prefix for display */
   headerPrefix?: string;
   /** Controls terminal-oriented output side effects. */
@@ -283,6 +288,7 @@ export interface WorkflowExecutionOptions extends PrMergeOptions {
   /** Stateless authored path for retrying from a new nested position. */
   restartPoint?: WorkflowRestartPoint;
   resumeSource?: RunResumeSource;
+  sourceResumePoint?: WorkflowResumePoint;
   /** Resolver used to inspect workflow_call targets before engine construction. */
   workflowCallResolver?: WorkflowCallResolver;
   /** Override report directory name (e.g. "20260201-015714-foptng") */
@@ -348,6 +354,8 @@ export interface TaskExecutionParallelOptions {
 }
 
 export interface ExecuteTaskOptions extends PrMergeOptions {
+  /** System command permission resolved before changing the project checkout. */
+  workflowSystemCommandsPolicy?: WorkflowSystemCommandsConfig;
   /** Goal ownership enables the terminal details used by the manager. */
   goalId?: string;
   /** Task content */
@@ -387,6 +395,7 @@ export interface ExecuteTaskOptions extends PrMergeOptions {
   /** Stateless authored path for retrying from a new nested position. */
   restartPoint?: WorkflowRestartPoint;
   resumeSource?: RunResumeSource;
+  sourceResumePoint?: WorkflowResumePoint;
   /** Override report directory name (e.g. "20260201-015714-foptng") */
   reportDirName?: string;
   taskSpec?: ResolvedTaskSpec;
@@ -464,6 +473,7 @@ export interface WorktreeConfirmationResult {
 
 export interface SelectAndExecuteOptions {
   workflow?: string;
+  workflowSystemCommandsPolicy?: WorkflowSystemCommandsConfig;
   /** Enable interactive user input during step transitions */
   interactiveUserInput?: boolean;
   /** Interactive mode result metadata for NDJSON logging */

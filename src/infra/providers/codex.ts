@@ -28,12 +28,15 @@ function toCodexOptions(options: ProviderCallOptions): CodexCallOptions {
   return {
     cwd: options.cwd,
     callerManagedSession: options.callerManagedSession,
+    executionPhase: options.executionPhase,
     abortSignal: options.abortSignal,
     sessionId: options.sessionId,
     model: options.model,
     reasoningEffort: options.effort ?? providerCodexOptions?.reasoningEffort,
     fastMode: providerCodexOptions?.fastMode,
     permissionMode: options.permissionMode,
+    aiReviewPermissions: options.aiReviewPermissions,
+    edit: options.edit,
     permissionControl: providerCodexOptions?.permissionControl,
     configProfile: providerCodexOptions?.configProfile,
     networkAccess: providerCodexOptions?.networkAccess,
@@ -54,7 +57,6 @@ function toCodexOptions(options: ProviderCallOptions): CodexCallOptions {
     childProcessEnv: options.childProcessEnv,
     preparedMcp: options.preparedMcp,
     mcpOnlySideEffects: options.mcpOnlySideEffects !== undefined,
-    onToolPermissionDecision: options.onToolPermissionDecision,
     internalAgentIsolation: options.internalAgentIsolation,
   };
 }
@@ -118,7 +120,6 @@ export class CodexProvider implements Provider {
         ...options,
         sessionId: undefined,
         internalAgentIsolation: 'strict-readonly',
-        onToolPermissionDecision: undefined,
         permissionMode: 'readonly',
         allowedTools: [],
         mcpServers: undefined,

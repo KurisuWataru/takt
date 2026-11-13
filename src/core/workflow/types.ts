@@ -83,9 +83,6 @@ export interface PermissionRequest {
 }
 
 export type { PermissionResult, PermissionUpdate };
-export type {
-  ToolPermissionDecisionRequest, ToolPermissionDecision, ToolPermissionDecisionHandler,
-} from './permission-types.js';
 
 export type PermissionHandler = (request: PermissionRequest) => Promise<PermissionResult>;
 
@@ -210,6 +207,7 @@ export interface RuntimeStepResolution {
 }
 
 export interface WorkflowSharedRuntimeState {
+  reportExecutions?: import('./report-execution-store.js').ReportExecutionStore;
   workflowPromptTree?: import('./workflow-prompt-context.js').WorkflowPromptTree;
   startedAtMs: number;
   activeResumePoint?: WorkflowResumePoint;
@@ -218,6 +216,7 @@ export interface WorkflowSharedRuntimeState {
   dynamicParallelSelectionStore?: DynamicParallelSelectionStore;
   dynamicFacetSelectionStore?: import('./dynamic-facets/dynamicFacetSelectionStore.js').DynamicFacetSelectionStore;
   workflowCallInvocationEvidence?: WorkflowCallInvocationEvidence;
+  resumeInvocationSource?: WorkflowResumePoint;
   workflowStepParticipationIndex?: WorkflowStepParticipationIndex;
   reportGenerationIndex?: import('./report-generation-index.js').ReportGenerationIndex;
   resumeArtifactOccurrenceIndex?: import('./run/resume-artifact-occurrence-index.js').ResumeArtifactOccurrenceIndex;
@@ -683,6 +682,7 @@ export interface WorkflowEngineOptions extends PrMergeOptions {
   /** Stateless authored path for retrying from a new nested position. */
   restartPoint?: WorkflowRestartPoint;
   resumeSource?: RunResumeSource;
+  sourceResumePoint?: WorkflowResumePoint;
   operationJournal?: WorkflowOperationJournalContext;
   /** Override report directory name (without parent path). */
   reportDirName?: string;
